@@ -5,6 +5,10 @@ Soroban smart contracts for the Fluxora treasury streaming protocol on Stellar. 
 ## Documentation
 
 - **[Stream contract docs](docs/streaming.md)** — Lifecycle, accrual formula, cliff/end_time, access control, events, and error codes.
+- **[Stream ID semantics](docs/stream-id-monotonicity-uniqueness.md)** — Monotonicity, uniqueness, counter management, and ordering guarantees.
+- **[Storage Layout](docs/storage.md)** — Contract storage architecture, key design, and TTL policies.
+- **[Deployment Guide](docs/DEPLOYMENT.md)** — Step-by-step deployment checklist for testnet and mainnet.
+- **[Audit Documentation](docs/audit.md)** — Entrypoints and invariants for auditors.
 
 <!-- Issue #207 — global resume: scaffold branch. -->
 <!-- Admin-only resume clears pause; post-incident checks in docs to follow. -->
@@ -19,6 +23,7 @@ Soroban smart contracts for the Fluxora treasury streaming protocol on Stellar. 
 - **Cancel semantics** — `cancel_stream` is valid only in `Active` or `Paused`; `Completed` and `Cancelled` return `InvalidState`.
 
 Implementation is scaffolded; storage, token transfers, and events are left for you to complete.
+
 - **Methods** — `init`, `create_stream`, `pause_stream`, `resume_stream`, `cancel_stream`, `withdraw`, `calculate_accrued`, `get_stream_state`, `set_admin`.
 - **Admin functions** — `pause_stream_as_admin`, `resume_stream_as_admin`, `cancel_stream_as_admin`, `set_admin` for key rotation.
 
@@ -34,10 +39,10 @@ Implementation is scaffolded; storage, token transfers, and events are left for 
 
 This project pins dependencies for **reproducible builds** and **auditor compatibility**:
 
-| Component | Version | Location | Purpose |
-|---|---|---|---|
-| **Rust** | 1.75 | `rust-toolchain.toml` | Ensures consistent WASM compilation |
-| **soroban-sdk** | 21.7.7 | `contracts/stream/Cargo.toml` | Locked to tested Stellar Soroban network version |
+| Component       | Version | Location                      | Purpose                                          |
+| --------------- | ------- | ----------------------------- | ------------------------------------------------ |
+| **Rust**        | 1.75    | `rust-toolchain.toml`         | Ensures consistent WASM compilation              |
+| **soroban-sdk** | 21.7.7  | `contracts/stream/Cargo.toml` | Locked to tested Stellar Soroban network version |
 
 When upgrading versions:
 
@@ -97,10 +102,11 @@ cargo test -p fluxora_stream
 ```
 
 This runs **unit tests** and **integration tests** in one go. No environment variables or external services are required. Integration tests use Soroban’s in-process test environment (`soroban_sdk::testutils`): the contract and a mock Stellar asset are built in memory, so no emulator or network is needed.
-**Note:** Tests rely on the `testutils` feature of the `soroban-sdk` to simulate the ledger environment and manipulate time (e.g., fast-forwarding to test cliff and end periods). 
+**Note:** Tests rely on the `testutils` feature of the `soroban-sdk` to simulate the ledger environment and manipulate time (e.g., fast-forwarding to test cliff and end periods).
 This feature is already enabled in `contracts/stream/Cargo.toml` under `[dev-dependencies]`. No extra environment setup is required.
 
 The test files are located at:
+
 - Unit tests: `contracts/stream/src/test.rs`
 - Integration tests: `contracts/stream/tests/integration_suite.rs`
 
@@ -167,15 +173,16 @@ We welcome contributions from the community! Please read our [Contributing Guide
 After each CI build, the pipeline computes a SHA256 hash of the contract WASM artifact(s) and uploads them as CI artifacts. This allows deployers and auditors to verify that the deployed contract matches the tested build.
 
 Artifacts:
+
 - fluxora_stream.wasm.sha256 — Hash of the main WASM build
 - fluxora_stream.optimized.wasm.sha256 — Hash of the optimized WASM (if present)
 
 To verify a deployment:
+
 1. Download the hash artifact from the CI run (GitHub Actions > Artifacts > fluxora_stream-wasm-hash).
 2. Compute the SHA256 hash of your local WASM file:
    bash
    sha256sum path/to/your/fluxora_stream.wasm
-   
 3. Compare the output to the CI hash file. If they match, your binary is identical to the tested build.
 
 This improves supply-chain clarity and ensures reproducible deployments.
