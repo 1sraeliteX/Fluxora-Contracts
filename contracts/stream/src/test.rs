@@ -2128,7 +2128,7 @@ fn test_calculate_accrued_permissionless_access() {
     let stream_id = ctx.create_default_stream();
 
     // Create a random third-party address (not sender, not recipient, not admin)
-    let third_party = Address::generate(&ctx.env);
+    let _third_party = Address::generate(&ctx.env);
 
     // Third party must be able to call calculate_accrued without auth
     // This would panic if auth was required
@@ -9372,8 +9372,14 @@ fn test_update_rate_per_second_emits_event() {
     let rate_update_events: std::vec::Vec<_> = events
         .iter()
         .filter(|e| {
-            if let Ok(topics) = <(Symbol, u64)>::try_from_val(&ctx.env, &e.1) {
-                topics.0 == Symbol::new(&ctx.env, "rate_upd") && topics.1 == stream_id
+            if e.1.len() >= 2 {
+                let topic0 = Symbol::from_val(&ctx.env, &e.1.get(0).unwrap());
+                let topic1_val = e.1.get(1).unwrap();
+                if let Ok(topic1) = u64::try_from_val(&ctx.env, &topic1_val) {
+                    topic0 == Symbol::new(&ctx.env, "rate_upd") && topic1 == stream_id
+                } else {
+                    false
+                }
             } else {
                 false
             }
