@@ -3939,11 +3939,11 @@ fn test_close_completed_stream_emits_correct_event_topic() {
     // Verify the event contains the correct stream_id
     // The event structure is: (symbol_short!("closed"), stream_id) -> StreamEvent::StreamClosed(stream_id)
     let found = events.iter().any(|e| {
-        let topics = e.topics.clone();
+        let topics = e.1.clone();
         topics.len() >= 2
             && topics
                 .get(1)
-                .map(|t| t.clone().try_from_val(&ctx.env) == Ok(stream_id))
+                .map(|t: &Val| t.clone().try_from_val(&ctx.env) == Ok(stream_id))
                 .unwrap_or(false)
     });
     assert!(
@@ -9107,7 +9107,7 @@ fn test_create_streams_batch_empty_when_paused() {
     let streams = Vec::new(&ctx.env);
 
     // Pause contract
-    ctx.client().set_contract_paused(&ctx.admin, &true);
+    ctx.client().set_contract_paused(&true);
 
     // Empty batch should still succeed (no-op)
     let ids = ctx.client().create_streams(&ctx.sender, &streams);
@@ -9121,9 +9121,9 @@ fn test_create_streams_batch_empty_recipient_index_unchanged() {
     let recipient = Address::generate(&ctx.env);
     let streams = Vec::new(&ctx.env);
 
-    let count_before = ctx.client().get_recipient_stream_count(recipient.clone());
+    let count_before = ctx.client().get_recipient_stream_count(&recipient);
     let ids = ctx.client().create_streams(&ctx.sender, &streams);
-    let count_after = ctx.client().get_recipient_stream_count(recipient.clone());
+    let count_after = ctx.client().get_recipient_stream_count(&recipient);
 
     assert_eq!(ids.len(), 0);
     assert_eq!(
@@ -10303,8 +10303,7 @@ fn test_update_rate_per_second_emits_event() {
         .count();
 
     assert_eq!(
-        rate_update_events.len(),
-        1,
+        rate_update_events_count, 1,
         "Should emit exactly one rate_upd event"
     );
 }
@@ -10448,7 +10447,7 @@ fn test_update_rate_per_second_with_overflow_protection() {
         &ctx.sender,
         &ctx.recipient,
         &deposit,
-        &initial_rate,
+        &max_rate,
         &0u64,
         &0u64,
         &1_000u64,
@@ -16487,8 +16486,6 @@ mod i128_boundary_streams {
         // Use rate=1 and a round deposit to avoid integer division truncation
         let rate: i128 = 1;
         let duration: u64 = 1_000;
-        let large_deposit: i128 = rate * duration as i128; // exactly 1000
-                                                           // Mint a large amount but use a clean deposit for precision
         let large_deposit: i128 = i128::MAX / 1_000_000 / 1_000 * 1_000; // divisible by 1000
         let rate: i128 = large_deposit / 1_000;
         let (env, contract_id, token_id, _a, sender, recipient) = setup_with_balance(large_deposit);

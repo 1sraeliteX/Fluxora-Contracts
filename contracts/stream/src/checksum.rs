@@ -43,10 +43,6 @@
 ///   on a different OS or architecture may produce different output for
 ///   non-WASM targets, but the `wasm32-unknown-unknown` target is
 ///   cross-compilation and should be deterministic across hosts.
-
-// This module is conditionally compiled only for tests.
-// It serves as documentation for the checksum verification process.
-
 #[cfg(test)]
 mod tests {
     // Placeholder test to ensure the module compiles
