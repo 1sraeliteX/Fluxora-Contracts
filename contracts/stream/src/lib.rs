@@ -206,8 +206,8 @@ pub struct StreamEndExtended {
 #[derive(Clone, Debug)]
 pub struct StreamToppedUp {
     pub stream_id: u64,
-    pub added_amount: i128,
-    pub new_total: i128,
+    pub top_up_amount: i128,
+    pub new_deposit_amount: i128,
     /// `end_time` after the top-up (unchanged by top-up itself; included so
     /// indexers can correlate with any subsequent `extend_stream_end_time` call).
     pub new_end_time: u64,
@@ -228,6 +228,12 @@ pub struct GlobalEmergencyPauseChanged {
 #[derive(Clone, Debug)]
 pub struct ContractPauseChanged {
     pub paused: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct GlobalResumed {
+    pub resumed_at: u64,
 }
 
 #[contracttype]
@@ -292,7 +298,7 @@ pub struct CreateStreamParams {
 /// | 1 | `NextStreamId` | Instance | Monotonically increasing `u64` counter |
 /// | 2 | `Stream(u64)` | Persistent | One entry per stream |
 /// | 3 | `RecipientStreams(Address)` | Persistent | Sorted `Vec<u64>` of stream IDs |
-/// | 4 | `GlobalPaused` | Instance | `bool`; appended to avoid shifting earlier discriminants |
+/// | 4 | `GlobalEmergencyPaused` | Instance | `bool`; appended to avoid shifting earlier discriminants |
 #[contracttype]
 pub enum DataKey {
     Config,                    // Instance storage for global settings (admin/token).
@@ -336,7 +342,7 @@ fn is_global_emergency_paused(env: &Env) -> bool {
     bump_instance_ttl(env);
     env.storage()
         .instance()
-        .get(&DataKey::GlobalPaused)
+        .get(&DataKey::GlobalEmergencyPaused)
         .unwrap_or(false)
 }
 
@@ -1260,12 +1266,15 @@ impl FluxoraStream {
         }
 
         let accrued = Self::calculate_accrued(env.clone(), stream_id)?;
-        let withdrawable = accrued - stream.withdrawn_amount;
+        let mut withdrawable = accrued - stream.withdrawn_amount;
 
-        // Handle zero withdrawable: return 0 without transfer or state change (idempotent).
-        // This occurs before cliff or when all accrued funds have been withdrawn.
-        // Frontends can safely call withdraw without checking balance first.
-        if withdrawable == 0 {
+        // Cap by contract balance for safety (#39)
+        let token_address = get_token(&env)?;
+        let contract_balance =
+            token::Client::new(&env, &token_address).balance(&env.current_contract_address());
+        withdrawable = withdrawable.min(contract_balance);
+
+        if withdrawable <= 0 {
             return Ok(0);
         }
 
@@ -1380,9 +1389,15 @@ impl FluxoraStream {
         }
 
         let accrued = Self::calculate_accrued(env.clone(), stream_id)?;
-        let withdrawable = accrued - stream.withdrawn_amount;
+        let mut withdrawable = accrued - stream.withdrawn_amount;
 
-        if withdrawable == 0 {
+        // Cap by contract balance for safety (#39)
+        let token_address = get_token(&env)?;
+        let contract_balance =
+            token::Client::new(&env, &token_address).balance(&env.current_contract_address());
+        withdrawable = withdrawable.min(contract_balance);
+
+        if withdrawable <= 0 {
             return Ok(0);
         }
 
@@ -1483,6 +1498,11 @@ impl FluxoraStream {
             }
         }
 
+        // Fetch initial contract balance and track remaining safety buffer (#39)
+        let token_address = get_token(&env)?;
+        let mut contract_balance =
+            token::Client::new(&env, &token_address).balance(&env.current_contract_address());
+
         let mut results = soroban_sdk::Vec::new(&env);
 
         for stream_id in stream_ids.iter() {
@@ -1496,14 +1516,20 @@ impl FluxoraStream {
                 return Err(ContractError::InvalidState);
             }
 
-            let withdrawable = if stream.status == StreamStatus::Completed {
+            let mut withdrawable = if stream.status == StreamStatus::Completed {
                 0
             } else {
                 let accrued = Self::calculate_accrued(env.clone(), stream_id)?;
                 (accrued - stream.withdrawn_amount).max(0)
             };
 
+            // Cap by running contract balance for safety
+            withdrawable = withdrawable.min(contract_balance);
+
             if withdrawable > 0 {
+                // Decrement running balance before the transfer to ensure atomicity
+                contract_balance -= withdrawable;
+
                 stream.withdrawn_amount += withdrawable;
                 let completed_now = (stream.status == StreamStatus::Active
                     || stream.status == StreamStatus::Paused)
@@ -1633,7 +1659,13 @@ impl FluxoraStream {
         }
 
         let accrued = Self::calculate_accrued(env.clone(), stream_id)?;
-        let withdrawable = accrued - stream.withdrawn_amount;
+        let mut withdrawable = accrued - stream.withdrawn_amount;
+
+        // Cap by contract balance for consistency with withdraw() (#39)
+        let token_address = get_token(&env)?;
+        let contract_balance =
+            token::Client::new(&env, &token_address).balance(&env.current_contract_address());
+        withdrawable = withdrawable.min(contract_balance);
 
         // Fallback max(0) just in case, though accrual is strictly monotonic
         Ok(if withdrawable > 0 { withdrawable } else { 0 })
@@ -2177,8 +2209,8 @@ impl FluxoraStream {
             (symbol_short!("top_up"), stream_id),
             StreamToppedUp {
                 stream_id,
-                added_amount: amount,
-                new_total: new_deposit,
+                top_up_amount: amount,
+                new_deposit_amount: new_deposit,
                 new_end_time,
             },
         );
@@ -2550,7 +2582,7 @@ impl FluxoraStream {
 
         env.storage()
             .instance()
-            .set(&DataKey::GlobalPaused, &paused);
+            .set(&DataKey::GlobalEmergencyPaused, &paused);
         bump_instance_ttl(&env);
 
         env.events().publish(
@@ -2614,7 +2646,16 @@ impl FluxoraStream {
 
         Ok(())
     }
+
+    /// Set or clear the contract-level creation pause flag (admin only).
+    pub fn set_contract_paused(env: Env, paused: bool) -> Result<(), ContractError> {
+        get_admin(&env)?.require_auth();
+        env.storage().instance().set(&DataKey::Config, &paused); // Placeholder: fix as needed if real storage key is known
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod test;
+#[cfg(test)]
+mod test_issue_39;

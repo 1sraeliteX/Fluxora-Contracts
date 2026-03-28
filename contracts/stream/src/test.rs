@@ -8,27 +8,29 @@ use soroban_sdk::{
 };
 
 use crate::{
-    ContractError, ContractPauseChanged, CreateStreamParams, FluxoraStream, FluxoraStreamClient,
-    GlobalEmergencyPauseChanged, StreamCreated, StreamEvent, StreamStatus, WithdrawalTo,
+    BatchWithdrawResult, Config, ContractError, ContractPauseChanged, CreateStreamParams,
+    FluxoraStream, FluxoraStreamClient, GlobalEmergencyPauseChanged, GlobalResumed, Stream,
+    StreamCreated, StreamEndExtended, StreamEndShortened, StreamEvent, StreamStatus, StreamToppedUp,
+    Withdrawal, WithdrawalTo,
 };
 
 // ---------------------------------------------------------------------------
 // Test helpers
 // ---------------------------------------------------------------------------
 
-struct TestContext<'a> {
-    env: Env,
-    contract_id: Address,
-    token_id: Address,
+pub(crate) struct TestContext<'a> {
+    pub(crate) env: Env,
+    pub(crate) contract_id: Address,
+    pub(crate) token_id: Address,
     #[allow(dead_code)]
-    admin: Address,
-    sender: Address,
-    recipient: Address,
-    sac: StellarAssetClient<'a>,
+    pub(crate) admin: Address,
+    pub(crate) sender: Address,
+    pub(crate) recipient: Address,
+    pub(crate) sac: StellarAssetClient<'a>,
 }
 
 impl<'a> TestContext<'a> {
-    fn setup() -> Self {
+    pub(crate) fn setup() -> Self {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -67,7 +69,7 @@ impl<'a> TestContext<'a> {
 
 impl<'a> TestContext<'a> {
     /// Setup context without mock_all_auths(), for explicit auth testing
-    fn setup_strict() -> Self {
+    pub(crate) fn setup_strict() -> Self {
         let env = Env::default();
 
         let contract_id = env.register_contract(None, FluxoraStream);
@@ -121,16 +123,16 @@ impl<'a> TestContext<'a> {
         }
     }
 
-    fn client(&self) -> FluxoraStreamClient<'_> {
+    pub(crate) fn client(&self) -> FluxoraStreamClient<'_> {
         FluxoraStreamClient::new(&self.env, &self.contract_id)
     }
 
-    fn token(&self) -> TokenClient<'_> {
+    pub(crate) fn token(&self) -> TokenClient<'_> {
         TokenClient::new(&self.env, &self.token_id)
     }
 
     /// Create a standard 1000-unit stream spanning 1000 seconds (rate 1/s, no cliff).
-    fn create_default_stream(&self) -> u64 {
+    pub(crate) fn create_default_stream(&self) -> u64 {
         self.env.ledger().set_timestamp(0);
         self.client().create_stream(
             &self.sender,
@@ -144,7 +146,7 @@ impl<'a> TestContext<'a> {
     }
 
     /// Create a stream with a cliff at t=500 out of 1000s.
-    fn create_cliff_stream(&self) -> u64 {
+    pub(crate) fn create_cliff_stream(&self) -> u64 {
         self.env.ledger().set_timestamp(0);
         self.client().create_stream(
             &self.sender,
@@ -157,7 +159,7 @@ impl<'a> TestContext<'a> {
         )
     }
 
-    fn create_max_rate_stream(&self) -> u64 {
+    pub(crate) fn create_max_rate_stream(&self) -> u64 {
         self.env.ledger().set_timestamp(0);
         self.client().create_stream(
             &self.sender,
@@ -170,7 +172,7 @@ impl<'a> TestContext<'a> {
         )
     }
 
-    fn create_half_max_rate_stream(&self) -> u64 {
+    pub(crate) fn create_half_max_rate_stream(&self) -> u64 {
         self.env.ledger().set_timestamp(0);
         self.client().create_stream(
             &self.sender,
@@ -8804,7 +8806,7 @@ fn test_create_streams_batch_empty_when_paused() {
     let streams = Vec::new(&ctx.env);
 
     // Pause contract
-    ctx.client().set_contract_paused(&ctx.admin, &true);
+    ctx.client().set_contract_paused(&true);
 
     // Empty batch should still succeed (no-op)
     let ids = ctx.client().create_streams(&ctx.sender, &streams);
@@ -8818,9 +8820,9 @@ fn test_create_streams_batch_empty_recipient_index_unchanged() {
     let recipient = Address::generate(&ctx.env);
     let streams = Vec::new(&ctx.env);
 
-    let count_before = ctx.client().get_recipient_stream_count(recipient.clone());
+    let count_before = ctx.client().get_recipient_stream_count(&recipient.clone());
     let ids = ctx.client().create_streams(&ctx.sender, &streams);
-    let count_after = ctx.client().get_recipient_stream_count(recipient.clone());
+    let count_after = ctx.client().get_recipient_stream_count(&recipient.clone());
 
     assert_eq!(ids.len(), 0);
     assert_eq!(
