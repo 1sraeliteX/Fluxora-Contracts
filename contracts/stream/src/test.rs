@@ -15158,41 +15158,41 @@ fn test_create_streams_batch_recipient_index_consistency() {
                 recipient: recipient1.clone(),
                 deposit_amount: 1000,
                 rate_per_second: 1,
-                start_time: 0,
-                cliff_time: 0,
-                end_time: 1000,
+                start_time: 1000,
+                cliff_time: 1000,
+                end_time: 2000,
             },
             CreateStreamParams {
                 recipient: recipient2.clone(),
                 deposit_amount: 2000,
                 rate_per_second: 1,
-                start_time: 0,
-                cliff_time: 0,
-                end_time: 2000,
+                start_time: 1000,
+                cliff_time: 1000,
+                end_time: 3000,
             },
             CreateStreamParams {
                 recipient: recipient1.clone(),
                 deposit_amount: 1500,
                 rate_per_second: 1,
-                start_time: 0,
-                cliff_time: 0,
-                end_time: 1500,
+                start_time: 1000,
+                cliff_time: 1000,
+                end_time: 2500,
             },
             CreateStreamParams {
                 recipient: recipient3.clone(),
                 deposit_amount: 3000,
                 rate_per_second: 1,
-                start_time: 0,
-                cliff_time: 0,
-                end_time: 3000,
+                start_time: 1000,
+                cliff_time: 1000,
+                end_time: 4000,
             },
             CreateStreamParams {
                 recipient: recipient2.clone(),
                 deposit_amount: 2500,
                 rate_per_second: 1,
-                start_time: 0,
-                cliff_time: 0,
-                end_time: 2500,
+                start_time: 1000,
+                cliff_time: 1000,
+                end_time: 3500,
             },
         ],
     );
@@ -15221,7 +15221,7 @@ fn test_create_streams_batch_recipient_index_consistency() {
     assert_eq!(ctx.client().get_recipient_stream_count(&recipient3), 1);
 
     // Now complete and close one stream from recipient1
-    ctx.env.ledger().set_timestamp(1000);
+    ctx.env.ledger().set_timestamp(2000);
     ctx.client().withdraw(&0);
     ctx.client().close_completed_stream(&0);
 
@@ -15242,24 +15242,26 @@ fn test_create_streams_batch_recipient_index_consistency() {
     assert_eq!(streams3_after.get(0).unwrap(), 3);
 
     // Create another batch to verify IDs continue correctly
+    ctx.env.ledger().set_timestamp(0);
+    // Mint more tokens for the second batch
+    let sac = StellarAssetClient::new(&ctx.env, &ctx.token_id);
+    sac.mint(&ctx.sender, &10_000_i128);
+
     let params2 = soroban_sdk::Vec::from_array(
         &ctx.env,
         [CreateStreamParams {
             recipient: recipient1.clone(),
             deposit_amount: 500,
             rate_per_second: 1,
-            start_time: 110,
-            cliff_time: 110,
-            end_time: 610,
+            start_time: 1000,
+            cliff_time: 1000,
+            end_time: 1500,
         }],
     );
 
-    let ids2_res = ctx.client().try_create_streams(&ctx.sender, &params2);
-    if let Err(res) = ids2_res {
-        panic!("create_streams failed with error: {:?}", res);
-    }
-    let ids2 = ids2_res.unwrap().unwrap();
-    assert_eq!(ids2.get(0).unwrap(), 5); // Next ID should be 5
+    let ids2 = ctx.client().create_streams(&ctx.sender, &params2);
+    let id2 = ids2.get(0).unwrap();
+    assert_eq!(id2, 5); // Next ID should be 5
 
     // Verify recipient1 now has streams 2 and 5 (sorted)
     let streams1_final = ctx.client().get_recipient_streams(&recipient1);
