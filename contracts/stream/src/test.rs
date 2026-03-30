@@ -15136,27 +15136,42 @@ fn test_batch_withdraw_mixed_stream_states_comprehensive() {
 
     // Set up different states
     ctx.env.ledger().set_timestamp(500);
-    
+
     // Pause one stream
     ctx.client().pause_stream(&id_paused);
-    
+
     // Cancel one stream (accrued = 500)
     ctx.client().cancel_stream(&id_cancelled);
     
     // Complete one stream
     ctx.env.ledger().set_timestamp(1000);
     ctx.client().withdraw(&id_completed);
-    
+
     // Verify states
-    assert_eq!(ctx.client().get_stream_state(&id_active).status, StreamStatus::Active);
-    assert_eq!(ctx.client().get_stream_state(&id_paused).status, StreamStatus::Paused);
-    assert_eq!(ctx.client().get_stream_state(&id_cancelled).status, StreamStatus::Cancelled);
-    assert_eq!(ctx.client().get_stream_state(&id_completed).status, StreamStatus::Completed);
-    assert_eq!(ctx.client().get_stream_state(&id_active_2).status, StreamStatus::Active);
+    assert_eq!(
+        ctx.client().get_stream_state(&id_active).status,
+        StreamStatus::Active
+    );
+    assert_eq!(
+        ctx.client().get_stream_state(&id_paused).status,
+        StreamStatus::Paused
+    );
+    assert_eq!(
+        ctx.client().get_stream_state(&id_cancelled).status,
+        StreamStatus::Cancelled
+    );
+    assert_eq!(
+        ctx.client().get_stream_state(&id_completed).status,
+        StreamStatus::Completed
+    );
+    assert_eq!(
+        ctx.client().get_stream_state(&id_active_2).status,
+        StreamStatus::Active
+    );
 
     // Attempt batch withdraw at t=800
     ctx.env.ledger().set_timestamp(800);
-    
+
     let mut stream_ids = Vec::new(&ctx.env);
     stream_ids.push_back(id_active);
     stream_ids.push_back(id_paused);
@@ -15168,8 +15183,11 @@ fn test_batch_withdraw_mixed_stream_states_comprehensive() {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         ctx.client().batch_withdraw(&ctx.recipient, &stream_ids);
     }));
-    
-    assert!(result.is_err(), "batch_withdraw with paused stream should panic");
+
+    assert!(
+        result.is_err(),
+        "batch_withdraw with paused stream should panic"
+    );
 
     // Now try without the paused stream
     let mut valid_stream_ids = Vec::new(&ctx.env);
@@ -15178,23 +15196,25 @@ fn test_batch_withdraw_mixed_stream_states_comprehensive() {
     valid_stream_ids.push_back(id_completed);
     valid_stream_ids.push_back(id_active_2);
 
-    let results = ctx.client().batch_withdraw(&ctx.recipient, &valid_stream_ids);
+    let results = ctx
+        .client()
+        .batch_withdraw(&ctx.recipient, &valid_stream_ids);
 
     // Verify results
     assert_eq!(results.len(), 4);
-    
+
     // Active stream: accrued=800, withdrawn=0 → amount=800
     assert_eq!(results.get(0).unwrap().stream_id, id_active);
     assert_eq!(results.get(0).unwrap().amount, 800);
-    
+
     // Cancelled stream: accrued frozen at 500, withdrawn=0 → amount=500
     assert_eq!(results.get(1).unwrap().stream_id, id_cancelled);
     assert_eq!(results.get(1).unwrap().amount, 500);
-    
+
     // Completed stream: nothing left → amount=0
     assert_eq!(results.get(2).unwrap().stream_id, id_completed);
     assert_eq!(results.get(2).unwrap().amount, 0);
-    
+
     // Active stream 2: accrued=1600 (rate=2), withdrawn=0 → amount=1600
     assert_eq!(results.get(3).unwrap().stream_id, id_active_2);
     assert_eq!(results.get(3).unwrap().amount, 1600);
@@ -15310,16 +15330,14 @@ fn test_create_streams_batch_recipient_index_consistency() {
     // Create another batch to verify IDs continue correctly
     let params2 = soroban_sdk::Vec::from_array(
         &ctx.env,
-        [
-            CreateStreamParams {
-                recipient: recipient1.clone(),
-                deposit_amount: 500,
-                rate_per_second: 1,
-                start_time: 0,
-                cliff_time: 0,
-                end_time: 500,
-            },
-        ],
+        [CreateStreamParams {
+            recipient: recipient1.clone(),
+            deposit_amount: 500,
+            rate_per_second: 1,
+            start_time: 0,
+            cliff_time: 0,
+            end_time: 500,
+        }],
     );
 
     let ids2 = ctx.client().create_streams(&ctx.sender, &params2);
@@ -15850,11 +15868,7 @@ fn test_create_streams_batch_deposit_overflow_is_atomic() {
 #[cfg(test)]
 mod i128_boundary_streams {
     use super::*;
-    use soroban_sdk::{
-        testutils::Ledger,
-        token::StellarAssetClient,
-        Address, Env,
-    };
+    use soroban_sdk::{testutils::Ledger, token::StellarAssetClient, Address, Env};
 
     // -----------------------------------------------------------------------
     // Shared helpers

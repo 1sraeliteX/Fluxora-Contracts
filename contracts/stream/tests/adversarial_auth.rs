@@ -77,7 +77,15 @@ impl<'a> Ctx<'a> {
         StellarAssetClient::new(&env, &token_id).mint(&sender, &10_000_i128);
 
         let token = soroban_sdk::token::Client::new(&env, &token_id);
-        Self { env, contract_id, token_id, admin, sender, recipient, token }
+        Self {
+            env,
+            contract_id,
+            token_id,
+            admin,
+            sender,
+            recipient,
+            token,
+        }
     }
 
     fn client(&self) -> FluxoraStreamClient<'_> {
