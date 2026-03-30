@@ -831,3 +831,146 @@ mod i128_boundary {
         assert_eq!(a, b);
     }
 }
+
+/// Property-based fuzz harness for `calculate_accrued_amount` (#292).
+///
+/// Uses `proptest` to generate arbitrary (start, cliff, end, rate, deposit, current_time)
+/// tuples and verifies the mathematical invariants that must hold for all inputs:
+///
+/// 1. **Boundedness**:   0 <= accrued <= deposit_amount
+/// 2. **Zero before cliff**: accrued == 0 when current_time < cliff_time
+/// 3. **Monotonicity**:  accrued(t) <= accrued(t+1) for all t
+/// 4. **Saturation**:    accrued == deposit when rate*(end-start) >= deposit and t >= end
+/// 5. **Determinism**:   same inputs always produce the same output
+/// 6. **Overflow safety**: no panic on any i128/u64 combination
+///
+/// Run with: `cargo test -p fluxora_stream accrual_fuzz`
+#[cfg(test)]
+mod accrual_fuzz {
+    extern crate std;
+    use super::calculate_accrued_amount;
+    use proptest::prelude::*;
+
+    // -----------------------------------------------------------------------
+    // Strategy: valid (start, cliff, end) triple where start < end and
+    // cliff is in [start, end].
+    // -----------------------------------------------------------------------
+    fn valid_schedule() -> impl Strategy<Value = (u64, u64, u64)> {
+        (0u64..=u64::MAX / 4, 0u64..=u64::MAX / 4, 1u64..=u64::MAX / 4).prop_map(
+            |(start, cliff_offset, duration)| {
+                let end = start.saturating_add(duration.max(1));
+                let cliff = start.saturating_add(cliff_offset % (end - start + 1));
+                (start, cliff, end)
+            },
+        )
+    }
+
+    // -----------------------------------------------------------------------
+    // Property 1: Boundedness — 0 <= accrued <= deposit_amount
+    // -----------------------------------------------------------------------
+    proptest! {
+        #[test]
+        fn prop_bounded_by_deposit(
+            (start, cliff, end) in valid_schedule(),
+            rate in 0i128..=i128::MAX / 2,
+            deposit in 0i128..=i128::MAX / 2,
+            current_time in 0u64..=u64::MAX,
+        ) {
+            let accrued = calculate_accrued_amount(start, cliff, end, rate, deposit, current_time);
+            prop_assert!(accrued >= 0, "accrued negative: {accrued}");
+            prop_assert!(accrued <= deposit, "accrued={accrued} > deposit={deposit}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Property 2: Zero before cliff
+    // -----------------------------------------------------------------------
+    proptest! {
+        #[test]
+        fn prop_zero_before_cliff(
+            (start, cliff, end) in valid_schedule(),
+            rate in 0i128..=i128::MAX / 2,
+            deposit in 0i128..=i128::MAX / 2,
+            current_time in 0u64..=u64::MAX,
+        ) {
+            prop_assume!(cliff > 0 && current_time < cliff);
+            let accrued = calculate_accrued_amount(start, cliff, end, rate, deposit, current_time);
+            prop_assert_eq!(accrued, 0, "expected 0 before cliff at t={current_time}, cliff={cliff}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Property 3: Monotonicity — accrued(t) <= accrued(t+1)
+    // -----------------------------------------------------------------------
+    proptest! {
+        #[test]
+        fn prop_monotonic_step(
+            (start, cliff, end) in valid_schedule(),
+            rate in 0i128..=i128::MAX / 2,
+            deposit in 0i128..=i128::MAX / 2,
+            t in 0u64..u64::MAX,
+        ) {
+            let a = calculate_accrued_amount(start, cliff, end, rate, deposit, t);
+            let b = calculate_accrued_amount(start, cliff, end, rate, deposit, t + 1);
+            prop_assert!(b >= a,
+                "monotonicity violated: accrued({t})={a} > accrued({})={b}", t + 1);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Property 4: Saturation — accrued == deposit for t >= end when rate covers deposit
+    // -----------------------------------------------------------------------
+    proptest! {
+        #[test]
+        fn prop_saturates_at_end_when_rate_covers_deposit(
+            start in 0u64..=1_000_000u64,
+            duration in 1u64..=1_000_000u64,
+            rate in 1i128..=1_000_000i128,
+            extra in 0u64..=1_000_000u64,
+        ) {
+            let end = start.saturating_add(duration);
+            let cliff = start;
+            let deposit = rate.saturating_mul(duration as i128);
+            let current_time = end.saturating_add(extra);
+
+            let accrued = calculate_accrued_amount(start, cliff, end, rate, deposit, current_time);
+            prop_assert_eq!(accrued, deposit,
+                "expected saturation at deposit={deposit} for t={current_time}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Property 5: Determinism — same inputs → same output
+    // -----------------------------------------------------------------------
+    proptest! {
+        #[test]
+        fn prop_deterministic(
+            (start, cliff, end) in valid_schedule(),
+            rate in 0i128..=i128::MAX / 2,
+            deposit in 0i128..=i128::MAX / 2,
+            current_time in 0u64..=u64::MAX,
+        ) {
+            let a = calculate_accrued_amount(start, cliff, end, rate, deposit, current_time);
+            let b = calculate_accrued_amount(start, cliff, end, rate, deposit, current_time);
+            prop_assert_eq!(a, b, "non-deterministic result at t={current_time}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Property 6: Overflow safety — no panic on any input combination
+    // -----------------------------------------------------------------------
+    proptest! {
+        #[test]
+        fn prop_no_panic_on_extreme_inputs(
+            start in 0u64..=u64::MAX / 2,
+            cliff in 0u64..=u64::MAX / 2,
+            end in 0u64..=u64::MAX,
+            rate in i128::MIN..=i128::MAX,
+            deposit in i128::MIN..=i128::MAX,
+            current_time in 0u64..=u64::MAX,
+        ) {
+            // Must not panic regardless of input combination.
+            let _ = calculate_accrued_amount(start, cliff, end, rate, deposit, current_time);
+        }
+    }
+}
