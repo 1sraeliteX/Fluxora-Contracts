@@ -698,6 +698,7 @@ fn adversarial_batch_withdraw_sender_rejected() {
         invoke: &MockAuthInvoke {
             contract: &ctx.contract_id,
             fn_name: "batch_withdraw",
+            fn_name: "batch_withdraw",
             args: (&ctx.sender, ids.clone()).into_val(&ctx.env),
             sub_invokes: &[],
         },
@@ -762,6 +763,7 @@ fn adversarial_batch_withdraw_cross_stream_recipient_rejected() {
         address: &ctx.recipient,
         invoke: &MockAuthInvoke {
             contract: &ctx.contract_id,
+            fn_name: "batch_withdraw",
             fn_name: "batch_withdraw",
             args: (&ctx.recipient, ids.clone()).into_val(&ctx.env),
             sub_invokes: &[],

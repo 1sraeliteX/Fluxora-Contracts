@@ -318,7 +318,6 @@ pub enum DataKey {
     NextStreamId,              // Instance storage for the auto-incrementing ID counter.
     Stream(u64),               // Persistent storage for individual stream data (O(1) lookup).
     RecipientStreams(Address), // Persistent storage for recipient stream index (sorted by stream_id).
-    /// Emergency pause flag (bool). Appended to avoid shifting existing key discriminants.
     GlobalPaused,
     /// Creation pause flag (bool). Appended to avoid shifting existing key discriminants.
     CreationPaused,
@@ -2260,7 +2259,7 @@ impl FluxoraStream {
     /// - If the stream is not `Completed` (Active, Paused, or Cancelled)
     ///
     /// # Events
-    /// - Publishes `closed(stream_id)` with `StreamEvent::StreamClosed(stream_id)` before removal
+    /// - Publishes `closed(stream_id)` with `StreamEvent::StreamClosed(stream_id)` before removal.
     ///
     /// # Operational guidance
     /// - Callable by anyone; no authorization required (permissionless cleanup).
@@ -2270,7 +2269,9 @@ impl FluxoraStream {
     pub fn close_completed_stream(env: Env, stream_id: u64) -> Result<(), ContractError> {
         let stream = load_stream(&env, stream_id)?;
 
-        if stream.status != StreamStatus::Completed {
+        // Only explicitly terminal streams (Completed or Cancelled) can be closed.
+        // Completed: fully withdrawn. Cancelled: refunded and terminated.
+        if stream.status != StreamStatus::Completed && stream.status != StreamStatus::Cancelled {
             return Err(ContractError::InvalidState);
         }
 
@@ -2724,7 +2725,7 @@ impl FluxoraStream {
     /// When `paused == true`, `create_stream` and `create_streams` revert with
     /// `ContractError::ContractPaused`. All other operations are unaffected.
     ///
-    /// This is distinct from `set_global_emergency_paused`, which blocks all operations.
+    /// This is distinct from global pause, which blocks all operations.
     ///
     /// # Authorization
     /// - Requires authorization from the contract admin.
@@ -2736,16 +2737,12 @@ impl FluxoraStream {
 
         // Store contract pause flag (if needed for persistence)
         // For now, we can store it as part of Config or as a separate state
->>>>>>> upstream/main
 
         env.events().publish(
             (symbol_short!("ct_pause"),),
             ContractPauseChanged { paused },
         );
-<<<<<<< HEAD
-=======
 
->>>>>>> upstream/main
         Ok(())
     }
 }

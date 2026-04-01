@@ -3855,8 +3855,7 @@ fn test_close_completed_stream_rejects_active() {
 }
 
 #[test]
-#[should_panic]
-fn test_close_completed_stream_rejects_cancelled() {
+fn test_close_cancelled_stream_success() {
     let ctx = TestContext::setup();
     let stream_id = ctx.create_default_stream();
 
@@ -9123,15 +9122,9 @@ fn test_create_streams_batch_empty_recipient_index_unchanged() {
     let recipient = Address::generate(&ctx.env);
     let streams = Vec::new(&ctx.env);
 
-<<<<<<< HEAD
-    let count_before = ctx.client().get_recipient_stream_count(&recipient.clone());
-    let ids = ctx.client().create_streams(&ctx.sender, &streams);
-    let count_after = ctx.client().get_recipient_stream_count(&recipient.clone());
-=======
     let count_before = ctx.client().get_recipient_stream_count(&recipient);
     let ids = ctx.client().create_streams(&ctx.sender, &streams);
     let count_after = ctx.client().get_recipient_stream_count(&recipient);
->>>>>>> upstream/main
 
     assert_eq!(ids.len(), 0);
     assert_eq!(
@@ -15870,15 +15863,9 @@ fn test_create_streams_batch_recipient_index_consistency() {
             recipient: recipient1.clone(),
             deposit_amount: 500,
             rate_per_second: 1,
-<<<<<<< HEAD
-            start_time: 1000,
-            cliff_time: 1000,
-            end_time: 1500,
-=======
             start_time: 0,
             cliff_time: 0,
             end_time: 500,
->>>>>>> upstream/main
         }],
     );
 
@@ -17237,3 +17224,124 @@ mod i128_boundary_streams {
         assert!(withdrawable > 0);
     }
 } // mod i128_boundary_streams
+
+#[cfg(test)]
+mod recipient_index_stress {
+    use super::*;
+    use soroban_sdk::{testutils::Ledger, Address, Vec};
+
+    #[test]
+    fn test_recipient_index_stress_large_scale() {
+        let ctx = TestContext::setup();
+        let recipient = Address::generate(&ctx.env);
+
+        // Mint sufficient tokens for 100 streams (100 * 1000 = 100,000)
+        // Default setup only mints 10,000.
+        ctx.sac.mint(&ctx.sender, &1_000_000_i128);
+
+        // Stress test: Create 100 streams for one recipient
+        // We use increments of 50 to avoid any single-call resource limits
+        let batch_size = 50;
+        let total_batches = 2; // 100 streams total
+
+        for _ in 0..total_batches {
+            let mut streams = Vec::new(&ctx.env);
+            for _ in 0..batch_size {
+                streams.push_back(CreateStreamParams {
+                    recipient: recipient.clone(),
+                    deposit_amount: 1000,
+                    rate_per_second: 1,
+                    start_time: 100,
+                    cliff_time: 100,
+                    end_time: 1100,
+                });
+            }
+            ctx.client().create_streams(&ctx.sender, &streams);
+        }
+
+        let index = ctx.client().get_recipient_streams(&recipient);
+        assert_eq!(index.len(), 100);
+
+        // Verify sorted order
+        for i in 0..index.len() - 1 {
+            assert!(index.get(i).unwrap() < index.get(i + 1).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_close_cancelled_stream_cleans_index() {
+        let ctx = TestContext::setup();
+        let stream_id = ctx.create_default_stream();
+
+        // Cancel the stream
+        ctx.client().cancel_stream(&stream_id);
+
+        let index_before = ctx.client().get_recipient_streams(&ctx.recipient);
+        assert_eq!(index_before.len(), 1);
+        assert_eq!(index_before.get(0).unwrap(), stream_id);
+
+        // Close the cancelled stream (New feature verification)
+        ctx.client().close_completed_stream(&stream_id);
+
+        let index_after = ctx.client().get_recipient_streams(&ctx.recipient);
+        assert_eq!(index_after.len(), 0);
+
+        // Verify stream is deleted from storage
+        let result = ctx.client().try_get_stream_state(&stream_id);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_recipient_index_consistency_after_many_removals() {
+        let ctx = TestContext::setup();
+        let recipient = Address::generate(&ctx.env);
+
+        // Create 10 streams
+        let mut stream_ids = Vec::new(&ctx.env);
+        for _ in 0..10 {
+            let id =
+                ctx.client()
+                    .create_stream(&ctx.sender, &recipient, &1000, &1, &100, &100, &1100);
+            stream_ids.push_back(id);
+        }
+
+        // Close streams from middle (5), start (0), and end (9)
+        // Note: IDs might not be 0-9 sequentially if multiple creation methods used,
+        // but here they will be because it's a fresh setup.
+
+        // 1. Close middle (ID at index 5)
+        // Make it Completed first
+        ctx.env.ledger().set_timestamp(1101);
+        ctx.client().withdraw(&stream_ids.get(5).unwrap());
+        ctx.client()
+            .close_completed_stream(&stream_ids.get(5).unwrap());
+
+        // 2. Close start (ID at index 0)
+        ctx.client().withdraw(&stream_ids.get(0).unwrap());
+        ctx.client()
+            .close_completed_stream(&stream_ids.get(0).unwrap());
+
+        // 3. Close end (ID at index 9)
+        ctx.client().withdraw(&stream_ids.get(9).unwrap());
+        ctx.client()
+            .close_completed_stream(&stream_ids.get(9).unwrap());
+
+        let index = ctx.client().get_recipient_streams(&recipient);
+        assert_eq!(index.len(), 7);
+
+        // Verify targeted IDs are gone
+        let dead_ids = [
+            stream_ids.get(0).unwrap(),
+            stream_ids.get(5).unwrap(),
+            stream_ids.get(9).unwrap(),
+        ];
+        for id in index.iter() {
+            assert!(!dead_ids.contains(&id));
+        }
+
+        // Verify sorted order remains
+        for i in 0..index.len() - 1 {
+            assert!(index.get(i).unwrap() < index.get(i + 1).unwrap());
+        }
+    }
+}
