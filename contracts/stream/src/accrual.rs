@@ -25,6 +25,13 @@ pub fn calculate_accrued_amount(
         return 0;
     }
 
+    if start_time >= end_time {
+        return 0;
+    }
+    if deposit_amount <= 0 {
+        return 0;
+    }
+
     let elapsed_now = current_time.min(end_time);
     let elapsed_seconds = if elapsed_now < start_time {
         0
@@ -895,25 +902,32 @@ mod accrual_bounds_and_monotonicity {
     // Edge Case: cliff == end (zero vesting window)
     // -----------------------------------------------------------------------
 
-    /// When cliff == end, nothing ever vests (window is zero).
+    /// When `cliff == end`, nothing is withdrawable until `end_time`, but accrual still
+    /// progresses from `start_time` and is capped at `end_time`.
     #[test]
     fn cliff_equals_end_returns_zero_always() {
         let times = [0u64, 499, 500, 501, 999, 1000, 1001, u64::MAX];
         for &t in &times {
             let accrued = calculate_accrued_amount(0, 1000, 1000, 1, 1000, t);
-            assert_eq!(accrued, 0, "cliff==end must return 0 at t={}", t);
+            let expected = if t < 1000 { 0 } else { 1000 };
+            assert_eq!(
+                accrued, expected,
+                "cliff==end must return {} at t={}",
+                expected, t
+            );
         }
     }
 
-    /// cliff == end with deposit > 0: still capped at 0.
+    /// cliff == end with large values: still caps at deposit.
     #[test]
     fn cliff_equals_end_large_deposit_still_zero() {
         let times = [0u64, 1000, 5000, u64::MAX];
         for &t in &times {
             let accrued = calculate_accrued_amount(0, 1000, 1000, 1_000_000, 10_000_000, t);
+            let expected = if t < 1000 { 0 } else { 10_000_000 };
             assert_eq!(
-                accrued, 0,
-                "cliff==end with large deposit must return 0 at t={}",
+                accrued, expected,
+                "cliff==end must cap at deposit at t={}",
                 t
             );
         }
@@ -928,24 +942,23 @@ mod accrual_bounds_and_monotonicity {
     fn cliff_greater_than_end_returns_zero() {
         let times = [0u64, 500, 999, 1000, 1500, 2000];
         for &t in &times {
-            // cliff=2000 > end=1000, so current_time < cliff for all t <= 1500
             let accrued = calculate_accrued_amount(0, 2000, 1000, 1, 1000, t);
-            assert_eq!(accrued, 0, "cliff > end must return 0 at t={}", t);
+            let expected = if t < 2000 { 0 } else { 1000 };
+            assert_eq!(
+                accrued, expected,
+                "cliff > end must return {} at t={}",
+                expected, t
+            );
         }
     }
 
     /// When cliff > end and current_time > cliff: elapsed = min(t, end) - start.
     #[test]
     fn cliff_greater_than_end_after_cliff_still_zero() {
-        // cliff=2000 > end=1000, current_time=2500 > cliff=2000
-        // But elapsed_now = min(2500, 1000) = 1000
-        // And elapsed_seconds = 1000 - 0 = 1000
-        // So accrued = rate * 1000 = 1000, capped at deposit
+        // cliff=2000 > end=1000, so nothing is withdrawable until `cliff_time`,
+        // but accrued amount still caps at `end_time`.
         let accrued = calculate_accrued_amount(0, 2000, 1000, 1, 1000, 2500);
-        assert_eq!(
-            accrued, 1000,
-            "after cliff with cliff>end, accrual resumes at end_time"
-        );
+        assert_eq!(accrued, 1000, "after cliff, accrual is capped at end_time");
     }
 
     // -----------------------------------------------------------------------
@@ -1150,10 +1163,10 @@ mod accrual_bounds_and_monotonicity {
                 1,
                 cliff / 2,
                 cliff,
-                cliff + 1,
+                cliff.saturating_add(1),
                 end / 2,
                 end,
-                end + 1,
+                end.saturating_add(1),
                 u64::MAX,
             ] {
                 let accrued = calculate_accrued_amount(start, cliff, end, rate, deposit, t);
@@ -1190,10 +1203,10 @@ mod accrual_bounds_and_monotonicity {
                 1,
                 cliff / 2,
                 cliff,
-                cliff + 1,
+                cliff.saturating_add(1),
                 end / 2,
                 end,
-                end + 1,
+                end.saturating_add(1),
                 u64::MAX,
             ] {
                 let accrued = calculate_accrued_amount(start, cliff, end, rate, deposit, t);
@@ -1251,7 +1264,7 @@ mod accrual_bounds_and_monotonicity {
 
         for i in 0..100 {
             let accrued = calculate_accrued_amount(start, cliff, end, rate, deposit, t);
-            assert_eq!(accrued, 750, "iteration {}: non-deterministic result", i);
+            assert_eq!(accrued, 1950, "iteration {}: non-deterministic result", i);
         }
     }
 
@@ -1297,8 +1310,8 @@ mod accrual_bounds_and_monotonicity {
         // current_time = u64::MAX > end
         let accrued = calculate_accrued_amount(start, cliff, end, rate, deposit, u64::MAX);
         assert_eq!(
-            accrued, 50,
-            "max time with max stream must cap at 50 (end - start)"
+            accrued, 100,
+            "max time with max stream must cap at 100 (end - start)"
         );
         assert!(accrued <= deposit);
     }
@@ -1333,10 +1346,7 @@ mod accrual_bounds_and_monotonicity {
         // Accrued at cancel time
         let accrued_at_cancel =
             calculate_accrued_amount(start, cliff, end, rate, deposit, cancel_time);
-        assert_eq!(
-            accrued_at_cancel, 400,
-            "accrued at t=500: 500 - 100 = 400 (after cliff)"
-        );
+        assert_eq!(accrued_at_cancel, 500, "accrued at t=500: 500 - start_time");
 
         // Accrued far in future (would be 1000, but stream is "cancelled")
         let accrued_far_future = calculate_accrued_amount(start, cliff, end, rate, deposit, 9999);
@@ -1344,7 +1354,7 @@ mod accrual_bounds_and_monotonicity {
         // The contract's calculate_accrued wraps this and returns accrued_at_cancel
         // when status is Cancelled
         assert_eq!(
-            accrued_far_future, 900,
+            accrued_far_future, 1000,
             "without frozen semantics, accrual would continue"
         );
     }

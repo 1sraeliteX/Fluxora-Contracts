@@ -236,19 +236,6 @@ pub struct ContractPauseChanged {
     pub paused: bool,
 }
 
-/// Emitted when the contract admin resumes the global emergency pause via `resume_global`.
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct GlobalResumed {
-    pub resumed_at: u64,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct GlobalResumed {
-    pub resumed_at: u64,
-}
-
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Stream {
@@ -318,7 +305,8 @@ pub enum DataKey {
     NextStreamId,              // Instance storage for the auto-incrementing ID counter.
     Stream(u64),               // Persistent storage for individual stream data (O(1) lookup).
     RecipientStreams(Address), // Persistent storage for recipient stream index (sorted by stream_id).
-    GlobalPaused,
+    /// Global emergency pause flag (bool). This is a contract-wide circuit breaker.
+    GlobalEmergencyPaused,
     /// Creation pause flag (bool). Appended to avoid shifting existing key discriminants.
     CreationPaused,
 }
@@ -351,11 +339,11 @@ fn get_admin(env: &Env) -> Result<Address, ContractError> {
     get_config(env).map(|c| c.admin)
 }
 
-/// Returns whether the contract is in global pause (default `false` if unset).
-fn is_global_paused(env: &Env) -> bool {
+/// Returns whether the contract is in **global emergency pause** (default `false` if unset).
+fn is_global_emergency_paused(env: &Env) -> bool {
     env.storage()
         .instance()
-        .get(&DataKey::GlobalPaused)
+        .get(&DataKey::GlobalEmergencyPaused)
         .unwrap_or(false)
 }
 
@@ -2664,7 +2652,6 @@ impl FluxoraStream {
             (symbol_short!("gl_pause"),),
             GlobalEmergencyPauseChanged { paused },
         );
-        Ok(())
     }
 
     /// Explicitly clear the **global emergency pause** and restore normal contract behaviour.
@@ -2707,7 +2694,9 @@ impl FluxoraStream {
             return Err(ContractError::InvalidState);
         }
 
-        env.storage().instance().set(&DataKey::GlobalPaused, &false);
+        env.storage()
+            .instance()
+            .set(&DataKey::GlobalEmergencyPaused, &false);
         bump_instance_ttl(&env);
 
         env.events().publish(
@@ -2735,8 +2724,10 @@ impl FluxoraStream {
     pub fn set_contract_paused(env: Env, paused: bool) -> Result<(), ContractError> {
         get_admin(&env)?.require_auth();
 
-        // Store contract pause flag (if needed for persistence)
-        // For now, we can store it as part of Config or as a separate state
+        env.storage()
+            .instance()
+            .set(&DataKey::CreationPaused, &paused);
+        bump_instance_ttl(&env);
 
         env.events().publish(
             (symbol_short!("ct_pause"),),

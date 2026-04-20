@@ -698,7 +698,6 @@ fn adversarial_batch_withdraw_sender_rejected() {
         invoke: &MockAuthInvoke {
             contract: &ctx.contract_id,
             fn_name: "batch_withdraw",
-            fn_name: "batch_withdraw",
             args: (&ctx.sender, ids.clone()).into_val(&ctx.env),
             sub_invokes: &[],
         },
@@ -763,7 +762,6 @@ fn adversarial_batch_withdraw_cross_stream_recipient_rejected() {
         address: &ctx.recipient,
         invoke: &MockAuthInvoke {
             contract: &ctx.contract_id,
-            fn_name: "batch_withdraw",
             fn_name: "batch_withdraw",
             args: (&ctx.recipient, ids.clone()).into_val(&ctx.env),
             sub_invokes: &[],
@@ -1341,7 +1339,7 @@ fn adversarial_shorten_end_time_recipient_rejected() {
         invoke: &MockAuthInvoke {
             contract: &ctx.contract_id,
             fn_name: "shorten_stream_end_time",
-            args: (stream_id, &500u64).into_val(&ctx.env),
+            args: (stream_id, 500u64).into_val(&ctx.env),
             sub_invokes: &[],
         },
     }]);
@@ -1371,11 +1369,11 @@ fn adversarial_extend_end_time_recipient_rejected() {
             args: (
                 &ctx.sender,
                 &ctx.recipient,
-                &2000_i128,
-                &1_i128,
-                &0u64,
-                &0u64,
-                &1000u64,
+                2000_i128,
+                1_i128,
+                0u64,
+                0u64,
+                1000u64,
             )
                 .into_val(&ctx.env),
             sub_invokes: &[MockAuthInvoke {
@@ -1432,7 +1430,7 @@ fn adversarial_update_rate_admin_rejected() {
         invoke: &MockAuthInvoke {
             contract: &ctx.contract_id,
             fn_name: "update_rate_per_second",
-            args: (stream_id, &2_i128).into_val(&ctx.env),
+            args: (stream_id, 2_i128).into_val(&ctx.env),
             sub_invokes: &[],
         },
     }]);
