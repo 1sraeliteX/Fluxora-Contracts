@@ -1376,7 +1376,6 @@ fn adversarial_extend_end_time_recipient_rejected() {
                 &0u64,
                 &0u64,
                 &1000u64,
->>>>>>> upstream/main
             )
                 .into_val(&ctx.env),
             sub_invokes: &[MockAuthInvoke {
@@ -1442,7 +1441,10 @@ fn adversarial_update_rate_admin_rejected() {
         ctx.client().update_rate_per_second(&stream_id, &2_i128);
     }));
 
-    assert!(result.is_err(), "admin must not update rate via sender path");
+    assert!(
+        result.is_err(),
+        "admin must not update rate via sender path"
+    );
     assert_eq!(
         ctx.client().get_stream_state(&stream_id).rate_per_second,
         state_before.rate_per_second

@@ -911,7 +911,11 @@ mod accrual_bounds_and_monotonicity {
         let times = [0u64, 1000, 5000, u64::MAX];
         for &t in &times {
             let accrued = calculate_accrued_amount(0, 1000, 1000, 1_000_000, 10_000_000, t);
-            assert_eq!(accrued, 0, "cliff==end with large deposit must return 0 at t={}", t);
+            assert_eq!(
+                accrued, 0,
+                "cliff==end with large deposit must return 0 at t={}",
+                t
+            );
         }
     }
 
@@ -938,7 +942,10 @@ mod accrual_bounds_and_monotonicity {
         // And elapsed_seconds = 1000 - 0 = 1000
         // So accrued = rate * 1000 = 1000, capped at deposit
         let accrued = calculate_accrued_amount(0, 2000, 1000, 1, 1000, 2500);
-        assert_eq!(accrued, 1000, "after cliff with cliff>end, accrual resumes at end_time");
+        assert_eq!(
+            accrued, 1000,
+            "after cliff with cliff>end, accrual resumes at end_time"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -965,7 +972,8 @@ mod accrual_bounds_and_monotonicity {
         // rate = 1, elapsed = i128::MAX → would overflow
         // The function caps at deposit, so use small deposit
         let deposit = 1_000_000_i128;
-        let accrued = calculate_accrued_amount(0, 0, i128::MAX as u64, 1, deposit, i128::MAX as u64);
+        let accrued =
+            calculate_accrued_amount(0, 0, i128::MAX as u64, 1, deposit, i128::MAX as u64);
         // elapsed = min(i128::MAX, i128::MAX) = i128::MAX
         // elapsed * rate = i128::MAX → overflows
         // Returns deposit_amount (1_000_000) on overflow, clamped to deposit
@@ -981,7 +989,10 @@ mod accrual_bounds_and_monotonicity {
         let elapsed: u64 = 2;
         let deposit = 1_000_000_i128;
         let accrued = calculate_accrued_amount(0, 0, 100, rate, deposit, elapsed);
-        assert_eq!(accrued, deposit, "large rate with small elapsed must overflow and return deposit");
+        assert_eq!(
+            accrued, deposit,
+            "large rate with small elapsed must overflow and return deposit"
+        );
     }
 
     /// Test that exact deposit = rate * duration doesn't overflow.
@@ -991,7 +1002,10 @@ mod accrual_bounds_and_monotonicity {
         let duration: u64 = 10;
         let deposit = rate * duration as i128; // exactly 1000
         let accrued = calculate_accrued_amount(0, 0, duration, rate, deposit, duration);
-        assert_eq!(accrued, deposit, "exact boundary: rate * duration = deposit");
+        assert_eq!(
+            accrued, deposit,
+            "exact boundary: rate * duration = deposit"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1010,7 +1024,9 @@ mod accrual_bounds_and_monotonicity {
                 assert!(
                     now >= prev,
                     "monotonicity violated at t={}: got {} < prev={}",
-                    t, now, prev
+                    t,
+                    now,
+                    prev
                 );
             }
             prev = now;
@@ -1026,7 +1042,13 @@ mod accrual_bounds_and_monotonicity {
         for t in 0..=1600u64 {
             let now = calculate_accrued_amount(start, cliff, end, rate, deposit, t);
             if t > 0 {
-                assert!(now >= prev, "monotonicity violated at t={}: {} < {}", t, now, prev);
+                assert!(
+                    now >= prev,
+                    "monotonicity violated at t={}: {} < {}",
+                    t,
+                    now,
+                    prev
+                );
             }
             prev = now;
         }
@@ -1041,7 +1063,13 @@ mod accrual_bounds_and_monotonicity {
         for t in 0..=200u64 {
             let now = calculate_accrued_amount(start, cliff, end, rate, deposit, t);
             if t > 0 {
-                assert!(now >= prev, "monotonicity violated at t={}: {} < {}", t, now, prev);
+                assert!(
+                    now >= prev,
+                    "monotonicity violated at t={}: {} < {}",
+                    t,
+                    now,
+                    prev
+                );
             }
             prev = now;
         }
@@ -1061,7 +1089,10 @@ mod accrual_bounds_and_monotonicity {
             assert!(
                 a2 >= a1,
                 "monotonicity violated: t1={}→{} vs t2={}→{}",
-                t1, a1, t2, a2
+                t1,
+                a1,
+                t2,
+                a2
             );
         }
     }
@@ -1069,15 +1100,30 @@ mod accrual_bounds_and_monotonicity {
     /// Monotonicity holds for long-duration streams.
     #[test]
     fn monotonicity_long_duration_stream() {
-        let (start, cliff, end, rate, deposit) = (0u64, 0u64, u32::MAX as u64, 1i128, u32::MAX as i128);
-        let times = [0u64, 1, 1000, 1_000_000, u32::MAX as u64 / 2, u32::MAX as u64];
+        let (start, cliff, end, rate, deposit) =
+            (0u64, 0u64, u32::MAX as u64, 1i128, u32::MAX as i128);
+        let times = [
+            0u64,
+            1,
+            1000,
+            1_000_000,
+            u32::MAX as u64 / 2,
+            u32::MAX as u64,
+        ];
 
         for window in times.windows(2) {
             let t1 = window[0];
             let t2 = window[1];
             let a1 = calculate_accrued_amount(start, cliff, end, rate, deposit, t1);
             let a2 = calculate_accrued_amount(start, cliff, end, rate, deposit, t2);
-            assert!(a2 >= a1, "monotonicity violated: t1={}→{} vs t2={}→{}", t1, a1, t2, a2);
+            assert!(
+                a2 >= a1,
+                "monotonicity violated: t1={}→{} vs t2={}→{}",
+                t1,
+                a1,
+                t2,
+                a2
+            );
         }
     }
 
@@ -1099,12 +1145,28 @@ mod accrual_bounds_and_monotonicity {
         ];
 
         for &(start, cliff, end, rate, deposit) in configs {
-            for t in [0u64, 1, cliff / 2, cliff, cliff + 1, end / 2, end, end + 1, u64::MAX] {
+            for t in [
+                0u64,
+                1,
+                cliff / 2,
+                cliff,
+                cliff + 1,
+                end / 2,
+                end,
+                end + 1,
+                u64::MAX,
+            ] {
                 let accrued = calculate_accrued_amount(start, cliff, end, rate, deposit, t);
                 assert!(
                     accrued >= 0,
                     "negative result for ({},{},{},{},{}) at t={}: {}",
-                    start, cliff, end, rate, deposit, t, accrued
+                    start,
+                    cliff,
+                    end,
+                    rate,
+                    deposit,
+                    t,
+                    accrued
                 );
             }
         }
@@ -1123,12 +1185,29 @@ mod accrual_bounds_and_monotonicity {
         ];
 
         for &(start, cliff, end, rate, deposit) in configs {
-            for t in [0u64, 1, cliff / 2, cliff, cliff + 1, end / 2, end, end + 1, u64::MAX] {
+            for t in [
+                0u64,
+                1,
+                cliff / 2,
+                cliff,
+                cliff + 1,
+                end / 2,
+                end,
+                end + 1,
+                u64::MAX,
+            ] {
                 let accrued = calculate_accrued_amount(start, cliff, end, rate, deposit, t);
                 assert!(
                     accrued <= deposit,
                     "exceeded deposit for ({},{},{},{},{}) at t={}: {} > {}",
-                    start, cliff, end, rate, deposit, t, accrued, deposit
+                    start,
+                    cliff,
+                    end,
+                    rate,
+                    deposit,
+                    t,
+                    accrued,
+                    deposit
                 );
             }
         }
@@ -1141,7 +1220,10 @@ mod accrual_bounds_and_monotonicity {
         let duration: u64 = 500;
         let deposit = rate * duration as i128; // 1000
         let accrued = calculate_accrued_amount(0, 0, duration, rate, deposit, duration);
-        assert_eq!(accrued, deposit, "saturating stream must reach deposit at end_time");
+        assert_eq!(
+            accrued, deposit,
+            "saturating stream must reach deposit at end_time"
+        );
     }
 
     /// Exact boundary: accrued < deposit at end_time when rate * duration < deposit.
@@ -1151,7 +1233,10 @@ mod accrual_bounds_and_monotonicity {
         let duration: u64 = 500;
         let deposit = rate * duration as i128 + 500; // 1000, but max accrual is 500
         let accrued = calculate_accrued_amount(0, 0, duration, rate, deposit, duration);
-        assert_eq!(accrued, 500, "undersaturating stream must have less than deposit at end");
+        assert_eq!(
+            accrued, 500,
+            "undersaturating stream must have less than deposit at end"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1211,7 +1296,10 @@ mod accrual_bounds_and_monotonicity {
 
         // current_time = u64::MAX > end
         let accrued = calculate_accrued_amount(start, cliff, end, rate, deposit, u64::MAX);
-        assert_eq!(accrued, 50, "max time with max stream must cap at 50 (end - start)");
+        assert_eq!(
+            accrued, 50,
+            "max time with max stream must cap at 50 (end - start)"
+        );
         assert!(accrued <= deposit);
     }
 
@@ -1243,14 +1331,21 @@ mod accrual_bounds_and_monotonicity {
         let cancel_time = 500u64;
 
         // Accrued at cancel time
-        let accrued_at_cancel = calculate_accrued_amount(start, cliff, end, rate, deposit, cancel_time);
-        assert_eq!(accrued_at_cancel, 400, "accrued at t=500: 500 - 100 = 400 (after cliff)");
+        let accrued_at_cancel =
+            calculate_accrued_amount(start, cliff, end, rate, deposit, cancel_time);
+        assert_eq!(
+            accrued_at_cancel, 400,
+            "accrued at t=500: 500 - 100 = 400 (after cliff)"
+        );
 
         // Accrued far in future (would be 1000, but stream is "cancelled")
         let accrued_far_future = calculate_accrued_amount(start, cliff, end, rate, deposit, 9999);
         // Note: The pure function doesn't implement frozen behavior
         // The contract's calculate_accrued wraps this and returns accrued_at_cancel
         // when status is Cancelled
-        assert_eq!(accrued_far_future, 900, "without frozen semantics, accrual would continue");
+        assert_eq!(
+            accrued_far_future, 900,
+            "without frozen semantics, accrual would continue"
+        );
     }
 }

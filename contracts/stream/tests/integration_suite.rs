@@ -3322,7 +3322,10 @@ fn end_time_boundary_t_exact_accrual_capped() {
 
     ctx.env.ledger().with_mut(|l| l.timestamp = 1000);
     let accrued = ctx.client().calculate_accrued(&stream_id);
-    assert_eq!(accrued, 1000, "T=end_time must cap accrual at deposit_amount");
+    assert_eq!(
+        accrued, 1000,
+        "T=end_time must cap accrual at deposit_amount"
+    );
 }
 
 /// T = end_time + 1: accrual remains capped; no extra tokens beyond deposit.
@@ -3430,7 +3433,7 @@ fn create_stream_start_time_one_second_in_past_rejected() {
         &ctx.recipient,
         &1000_i128,
         &1_i128,
-        &99u64,  // start_time = now − 1
+        &99u64, // start_time = now − 1
         &99u64,
         &1099u64,
     );
