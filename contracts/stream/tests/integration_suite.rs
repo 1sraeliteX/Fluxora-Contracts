@@ -3477,3 +3477,407 @@ fn shorten_end_time_one_second_future_accepted() {
         .try_shorten_stream_end_time(&stream_id, &501u64);
     assert!(result.is_ok(), "new_end_time = now+1 must be accepted");
 }
+
+// ---- Cancel Stream Refund Invariants Tests ----
+
+/// Test cancel before cliff: full refund, zero accrued, freeze behavior
+#[test]
+fn cancel_before_cliff_full_refund_zero_accrued() {
+    let ctx = TestContext::setup();
+    
+    // Create stream: 1000 tokens over 1000s, cliff at 500s
+    ctx.env.ledger().set_timestamp(0);
+    let stream_id = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &1_i128,
+        &0u64,     // start_time
+        &500u64,   // cliff_time
+        &1000u64,  // end_time
+    );
+
+    // Cancel before cliff (t=300)
+    ctx.env.ledger().set_timestamp(300);
+    let sender_before = ctx.token.balance(&ctx.sender);
+    ctx.client().cancel_stream(&stream_id);
+    let sender_after = ctx.token.balance(&ctx.sender);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    let refund = sender_after - sender_before;
+    let frozen_accrued = ctx.client().calculate_accrued(&stream_id);
+
+    // Invariants: refund + frozen_accrued == deposit
+    assert_eq!(refund, 1000, "Full refund before cliff");
+    assert_eq!(frozen_accrued, 0, "Zero accrued before cliff");
+    assert_eq!(refund + frozen_accrued, state.deposit_amount, "Refund + accrued = deposit");
+    assert_eq!(state.status, StreamStatus::Cancelled);
+    assert_eq!(state.cancelled_at, Some(300));
+
+    // Freeze test: advance time, accrued remains frozen
+    ctx.env.ledger().set_timestamp(2000);
+    let still_frozen = ctx.client().calculate_accrued(&stream_id);
+    assert_eq!(still_frozen, 0, "Accrued remains frozen at zero");
+}
+
+/// Test cancel exactly at cliff: partial refund, accrued starts at cliff
+#[test]
+fn cancel_at_cliff_partial_refund_accrued_starts() {
+    let ctx = TestContext::setup();
+    
+    // Create stream: 1200 tokens over 1200s, cliff at 400s
+    ctx.env.ledger().set_timestamp(0);
+    let stream_id = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1200_i128,
+        &1_i128,
+        &0u64,     // start_time
+        &400u64,   // cliff_time
+        &1200u64,  // end_time
+    );
+
+    // Cancel exactly at cliff (t=400)
+    ctx.env.ledger().set_timestamp(400);
+    let sender_before = ctx.token.balance(&ctx.sender);
+    ctx.client().cancel_stream(&stream_id);
+    let sender_after = ctx.token.balance(&ctx.sender);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    let refund = sender_after - sender_before;
+    let frozen_accrued = ctx.client().calculate_accrued(&stream_id);
+
+    // At cliff: 400 tokens accrued (from start_time 0 to cliff 400)
+    assert_eq!(frozen_accrued, 400, "Accrued at cliff");
+    assert_eq!(refund, 800, "Refund = deposit - accrued");
+    assert_eq!(refund + frozen_accrued, state.deposit_amount, "Refund + accrued = deposit");
+    assert_eq!(state.status, StreamStatus::Cancelled);
+    assert_eq!(state.cancelled_at, Some(400));
+
+    // Freeze test: advance time, accrued remains frozen
+    ctx.env.ledger().set_timestamp(2000);
+    let still_frozen = ctx.client().calculate_accrued(&stream_id);
+    assert_eq!(still_frozen, 400, "Accrued remains frozen at cliff value");
+}
+
+/// Test cancel near end: minimal refund, near-full accrued
+#[test]
+fn cancel_near_end_minimal_refund_near_full_accrued() {
+    let ctx = TestContext::setup();
+    
+    // Create stream: 2000 tokens over 2000s, no cliff
+    ctx.env.ledger().set_timestamp(0);
+    let stream_id = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &2000_i128,
+        &1_i128,
+        &0u64,     // start_time
+        &0u64,     // cliff_time
+        &2000u64,  // end_time
+    );
+
+    // Cancel near end (t=1900)
+    ctx.env.ledger().set_timestamp(1900);
+    let sender_before = ctx.token.balance(&ctx.sender);
+    ctx.client().cancel_stream(&stream_id);
+    let sender_after = ctx.token.balance(&ctx.sender);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    let refund = sender_after - sender_before;
+    let frozen_accrued = ctx.client().calculate_accrued(&stream_id);
+
+    // Near end: 1900 tokens accrued, 100 refund
+    assert_eq!(frozen_accrued, 1900, "Near-full accrued");
+    assert_eq!(refund, 100, "Minimal refund");
+    assert_eq!(refund + frozen_accrued, state.deposit_amount, "Refund + accrued = deposit");
+    assert_eq!(state.status, StreamStatus::Cancelled);
+    assert_eq!(state.cancelled_at, Some(1900));
+
+    // Freeze test: advance past end, accrued remains frozen
+    ctx.env.ledger().set_timestamp(3000);
+    let still_frozen = ctx.client().calculate_accrued(&stream_id);
+    assert_eq!(still_frozen, 1900, "Accrued remains frozen, doesn't reach full deposit");
+}
+
+/// Test cancel after end: should fail with InvalidState
+#[test]
+fn cancel_after_end_must_fail() {
+    let ctx = TestContext::setup();
+    
+    // Create stream: 1000 tokens over 1000s
+    ctx.env.ledger().set_timestamp(0);
+    let stream_id = ctx.create_default_stream();
+
+    // Advance past end time
+    ctx.env.ledger().set_timestamp(1500);
+
+    // Cancel should fail
+    let result = ctx.client().try_cancel_stream(&stream_id);
+    assert_eq!(result, Err(Ok(ContractError::InvalidState)), 
+               "Cancel after end must fail with InvalidState");
+
+    // Stream should remain Active
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.status, StreamStatus::Active);
+    assert_eq!(state.cancelled_at, None);
+}
+
+/// Test cancel with partial withdrawals before cancellation
+#[test]
+fn cancel_with_partial_withdrawals_before_cancel() {
+    let ctx = TestContext::setup();
+    
+    // Create stream: 2000 tokens over 1000s (2 tokens/sec)
+    ctx.env.ledger().set_timestamp(0);
+    let stream_id = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &2000_i128,
+        &2_i128,
+        &0u64,     // start_time
+        &0u64,     // cliff_time
+        &1000u64,  // end_time
+    );
+
+    // Withdraw 800 tokens at t=400 (400s * 2 tokens/sec = 800)
+    ctx.env.ledger().set_timestamp(400);
+    let withdrawn = ctx.client().withdraw(&stream_id);
+    assert_eq!(withdrawn, 800);
+
+    // Cancel at t=600 (additional 200s * 2 tokens/sec = 400 accrued)
+    ctx.env.ledger().set_timestamp(600);
+    let sender_before = ctx.token.balance(&ctx.sender);
+    ctx.client().cancel_stream(&stream_id);
+    let sender_after = ctx.token.balance(&ctx.sender);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    let refund = sender_after - sender_before;
+    let frozen_accrued = ctx.client().calculate_accrued(&stream_id);
+
+    // Total accrued: 800 (withdrawn) + 400 (frozen) = 1200
+    // Refund: 2000 - 1200 = 800
+    assert_eq!(frozen_accrued, 400, "Frozen accrued after partial withdrawal");
+    assert_eq!(refund, 800, "Refund after partial withdrawal");
+    assert_eq!(state.withdrawn_amount, 800, "Withdrawn amount preserved");
+    assert_eq!(refund + frozen_accrued + state.withdrawn_amount, state.deposit_amount, 
+               "Refund + frozen_accrued + withdrawn = deposit");
+    assert_eq!(state.status, StreamStatus::Cancelled);
+    assert_eq!(state.cancelled_at, Some(600));
+
+    // Freeze test: advance time, frozen accrued doesn't change
+    ctx.env.ledger().set_timestamp(2000);
+    let still_frozen = ctx.client().calculate_accrued(&stream_id);
+    assert_eq!(still_frozen, 400, "Frozen accrued unchanged after time advance");
+}
+
+/// Test cancel time boundary: cancel just before vs just after cliff
+#[test]
+fn cancel_time_boundary_around_cliff() {
+    let ctx = TestContext::setup();
+    
+    // Create stream: 1000 tokens over 1000s, cliff at 500s
+    ctx.env.ledger().set_timestamp(0);
+    let stream_id1 = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &1_i128,
+        &0u64,     // start_time
+        &500u64,   // cliff_time
+        &1000u64,  // end_time
+    );
+
+    let stream_id2 = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &1_i128,
+        &0u64,     // start_time
+        &500u64,   // cliff_time
+        &1000u64,  // end_time
+    );
+
+    // Cancel just before cliff (t=499)
+    ctx.env.ledger().set_timestamp(499);
+    let sender_before1 = ctx.token.balance(&ctx.sender);
+    ctx.client().cancel_stream(&stream_id1);
+    let sender_after1 = ctx.token.balance(&ctx.sender);
+
+    // Cancel just after cliff (t=501)
+    ctx.env.ledger().set_timestamp(501);
+    let sender_before2 = ctx.token.balance(&ctx.sender);
+    ctx.client().cancel_stream(&stream_id2);
+    let sender_after2 = ctx.token.balance(&ctx.sender);
+
+    let state1 = ctx.client().get_stream_state(&stream_id1);
+    let state2 = ctx.client().get_stream_state(&stream_id2);
+    let refund1 = sender_after1 - sender_before1;
+    let refund2 = sender_after2 - sender_before2;
+    let frozen1 = ctx.client().calculate_accrued(&stream_id1);
+    let frozen2 = ctx.client().calculate_accrued(&stream_id2);
+
+    // Before cliff: zero accrued, full refund
+    assert_eq!(frozen1, 0, "Zero accrued just before cliff");
+    assert_eq!(refund1, 1000, "Full refund just before cliff");
+
+    // After cliff: 501 accrued, 499 refund
+    assert_eq!(frozen2, 501, "501 accrued just after cliff");
+    assert_eq!(refund2, 499, "499 refund just after cliff");
+
+    // Both satisfy invariants
+    assert_eq!(refund1 + frozen1, state1.deposit_amount, "Invariant before cliff");
+    assert_eq!(refund2 + frozen2, state2.deposit_amount, "Invariant after cliff");
+}
+
+/// Test cancel time boundary: cancel just before vs just after end
+#[test]
+fn cancel_time_boundary_around_end() {
+    let ctx = TestContext::setup();
+    
+    // Create stream: 1000 tokens over 1000s
+    ctx.env.ledger().set_timestamp(0);
+    let stream_id1 = ctx.create_default_stream(); // end=1000
+    let stream_id2 = ctx.create_default_stream(); // end=1000
+
+    // Cancel just before end (t=999)
+    ctx.env.ledger().set_timestamp(999);
+    let sender_before1 = ctx.token.balance(&ctx.sender);
+    ctx.client().cancel_stream(&stream_id1);
+    let sender_after1 = ctx.token.balance(&ctx.sender);
+
+    // Cancel just after end (t=1001) - should fail
+    ctx.env.ledger().set_timestamp(1001);
+    let result = ctx.client().try_cancel_stream(&stream_id2);
+    assert_eq!(result, Err(Ok(ContractError::InvalidState)), 
+               "Cancel after end must fail");
+
+    let state1 = ctx.client().get_stream_state(&stream_id1);
+    let state2 = ctx.client().get_stream_state(&stream_id2);
+    let refund1 = sender_after1 - sender_before1;
+    let frozen1 = ctx.client().calculate_accrued(&stream_id1);
+
+    // Before end: 999 accrued, 1 refund
+    assert_eq!(frozen1, 999, "999 accrued just before end");
+    assert_eq!(refund1, 1, "1 refund just before end");
+    assert_eq!(refund1 + frozen1, state1.deposit_amount, "Invariant before end");
+
+    // After end: stream remains active, can still withdraw full amount
+    assert_eq!(state2.status, StreamStatus::Active, "Stream remains active after failed cancel");
+    let full_accrued = ctx.client().calculate_accrued(&stream_id2);
+    assert_eq!(full_accrued, 1000, "Full amount available after end");
+}
+
+/// Test admin cancel with same invariants as sender cancel
+#[test]
+fn admin_cancel_refund_invariants_identical_to_sender_cancel() {
+    let ctx = TestContext::setup();
+    
+    // Create two identical streams
+    ctx.env.ledger().set_timestamp(0);
+    let stream_id1 = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1500_i128,
+        &1_i128,
+        &0u64,     // start_time
+        &300u64,   // cliff_time
+        &1500u64,  // end_time
+    );
+
+    let stream_id2 = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1500_i128,
+        &1_i128,
+        &0u64,     // start_time
+        &300u64,   // cliff_time
+        &1500u64,  // end_time
+    );
+
+    // Cancel via sender at t=600
+    ctx.env.ledger().set_timestamp(600);
+    let sender_before1 = ctx.token.balance(&ctx.sender);
+    ctx.client().cancel_stream(&stream_id1);
+    let sender_after1 = ctx.token.balance(&ctx.sender);
+
+    // Cancel via admin at t=600
+    let sender_before2 = ctx.token.balance(&ctx.sender);
+    ctx.client().cancel_stream_as_admin(&stream_id2);
+    let sender_after2 = ctx.token.balance(&ctx.sender);
+
+    let state1 = ctx.client().get_stream_state(&stream_id1);
+    let state2 = ctx.client().get_stream_state(&stream_id2);
+    let refund1 = sender_after1 - sender_before1;
+    let refund2 = sender_after2 - sender_before2;
+    let frozen1 = ctx.client().calculate_accrued(&stream_id1);
+    let frozen2 = ctx.client().calculate_accrued(&stream_id2);
+
+    // Both should have identical results
+    assert_eq!(refund1, refund2, "Refund amounts identical");
+    assert_eq!(frozen1, frozen2, "Frozen accrued identical");
+    assert_eq!(state1.status, state2.status, "Status identical");
+    assert_eq!(state1.cancelled_at, state2.cancelled_at, "Cancel timestamp identical");
+
+    // Invariants hold for both
+    assert_eq!(refund1 + frozen1, state1.deposit_amount, "Sender cancel invariant");
+    assert_eq!(refund2 + frozen2, state2.deposit_amount, "Admin cancel invariant");
+}
+
+/// Test freeze behavior across multiple time advances after cancel
+#[test]
+fn freeze_behavior_across_multiple_time_advances() {
+    let ctx = TestContext::setup();
+    
+    // Create stream: 1000 tokens over 1000s
+    ctx.env.ledger().set_timestamp(0);
+    let stream_id = ctx.create_default_stream();
+
+    // Cancel at t=300
+    ctx.env.ledger().set_timestamp(300);
+    ctx.client().cancel_stream(&stream_id);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.cancelled_at, Some(300));
+
+    // Test frozen accrued at multiple future timestamps
+    let test_times = vec![500, 1000, 2000, 10000];
+    for &time in &test_times {
+        ctx.env.ledger().set_timestamp(time);
+        let accrued = ctx.client().calculate_accrued(&stream_id);
+        assert_eq!(accrued, 300, "Accrued frozen at cancel time for all future timestamps");
+    }
+}
+
+/// Test cancellation with zero rate stream (edge case)
+#[test]
+fn cancel_zero_rate_stream_full_refund() {
+    let ctx = TestContext::setup();
+    
+    // Create stream with zero rate
+    ctx.env.ledger().set_timestamp(0);
+    let stream_id = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &0_i128,   // zero rate
+        &0u64,     // start_time
+        &0u64,     // cliff_time
+        &1000u64,  // end_time
+    );
+
+    // Cancel at t=500
+    ctx.env.ledger().set_timestamp(500);
+    let sender_before = ctx.token.balance(&ctx.sender);
+    ctx.client().cancel_stream(&stream_id);
+    let sender_after = ctx.token.balance(&ctx.sender);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    let refund = sender_after - sender_before;
+    let frozen_accrued = ctx.client().calculate_accrued(&stream_id);
+
+    // Zero rate means zero accrued regardless of time
+    assert_eq!(frozen_accrued, 0, "Zero accrued for zero rate stream");
+    assert_eq!(refund, 1000, "Full refund for zero rate stream");
+    assert_eq!(refund + frozen_accrued, state.deposit_amount, "Invariant holds for zero rate");
+}
