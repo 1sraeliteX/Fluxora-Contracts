@@ -17355,7 +17355,10 @@ fn test_batch_withdraw_adjacent_duplicates_rejected() {
         "no transfer must occur on duplicate rejection"
     );
     let state = ctx.client().get_stream_state(&id0);
-    assert_eq!(state.withdrawn_amount, 0, "withdrawn_amount must not change");
+    assert_eq!(
+        state.withdrawn_amount, 0,
+        "withdrawn_amount must not change"
+    );
     assert_eq!(state.status, StreamStatus::Active);
 }
 
