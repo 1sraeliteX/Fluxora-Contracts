@@ -2709,7 +2709,7 @@ fn integration_uninitialised_version_works() {
     let env = Env::default();
     let contract_id = env.register_contract(None, FluxoraStream);
     let client = FluxoraStreamClient::new(&env, &contract_id);
-    assert_eq!(client.version(), 1);
+    assert_eq!(client.version(), 2);
 }
 
 /// Uninitialised contract: stream count returns 0.
@@ -3476,4 +3476,415 @@ fn shorten_end_time_one_second_future_accepted() {
         .client()
         .try_shorten_stream_end_time(&stream_id, &501u64);
     assert!(result.is_ok(), "new_end_time = now+1 must be accepted");
+}
+
+// ===========================================================================
+// Tests — decrease_rate_per_second (safe rate decrease with checkpointing)
+// ===========================================================================
+
+/// Helper: create a stream with end=2000, rate=10, deposit=20000 for rate-decrease tests.
+fn make_big_stream(ctx: &TestContext) -> u64 {
+    // Mint extra tokens to the sender for the larger deposit.
+    StellarAssetClient::new(&ctx.env, &ctx.token_id).mint(&ctx.sender, &20_000_i128);
+    ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &20_000_i128, // deposit: 10 * 2000
+        &10_i128,     // rate: 10 tok/s
+        &0u64,        // start
+        &0u64,        // cliff
+        &2_000u64,    // end
+    )
+}
+
+// ---------------------------------------------------------------------------
+// 1. Basic success: rate decreases, deposit refunded, accrual unchanged
+// ---------------------------------------------------------------------------
+#[test]
+fn decrease_rate_basic_refund_and_accrual_preserved() {
+    let ctx = TestContext::setup();
+    let sid = make_big_stream(&ctx);
+
+    ctx.env.ledger().with_mut(|l| l.timestamp = 500);
+
+    let sender_before = ctx.token.balance(&ctx.sender);
+    ctx.client().decrease_rate_per_second(&sid, &5_i128);
+
+    // Accrued immediately after decrease must equal accrued immediately before.
+    let state = ctx.client().get_stream_state(&sid);
+    let accrued = ctx.client().calculate_accrued(&sid);
+    // At t=500: 10 tok/s * 500s = 5000 checkpointed; 5*(500-500)=0 added → 5000.
+    assert_eq!(accrued, 5_000, "accrual must not decrease");
+    assert_eq!(state.rate_per_second, 5);
+    assert_eq!(state.checkpointed_amount, 5_000);
+    assert_eq!(state.checkpointed_at, 500);
+
+    // New deposit = 5000 + 5*(2000-500) = 5000 + 7500 = 12500; refund = 20000-12500 = 7500
+    assert_eq!(state.deposit_amount, 12_500);
+    let refund = ctx.token.balance(&ctx.sender) - sender_before;
+    assert_eq!(refund, 7_500, "sender must receive refund of unreachable deposit");
+}
+
+// ---------------------------------------------------------------------------
+// 2. Withdrawable never decreases across the decrease boundary
+// ---------------------------------------------------------------------------
+#[test]
+fn decrease_rate_withdrawable_never_decreases() {
+    let ctx = TestContext::setup();
+    let sid = make_big_stream(&ctx);
+
+    ctx.env.ledger().with_mut(|l| l.timestamp = 600);
+    let withdrawable_before = ctx.client().get_withdrawable(&sid);
+
+    ctx.client().decrease_rate_per_second(&sid, &3_i128);
+
+    let withdrawable_after = ctx.client().get_withdrawable(&sid);
+    assert!(
+        withdrawable_after >= withdrawable_before,
+        "withdrawable must not decrease: before={withdrawable_before} after={withdrawable_after}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 3. Total payable never exceeds deposit
+// ---------------------------------------------------------------------------
+#[test]
+fn decrease_rate_total_payable_leq_deposit() {
+    let ctx = TestContext::setup();
+    let sid = make_big_stream(&ctx);
+
+    ctx.env.ledger().with_mut(|l| l.timestamp = 300);
+    ctx.client().decrease_rate_per_second(&sid, &2_i128);
+
+    let state = ctx.client().get_stream_state(&sid);
+    // max payable = checkpointed_amount + new_rate * remaining
+    let max_payable = state.checkpointed_amount
+        + state.rate_per_second * (state.end_time - state.checkpointed_at) as i128;
+    assert!(
+        max_payable <= state.deposit_amount,
+        "max_payable ({max_payable}) must <= deposit ({d})",
+        d = state.deposit_amount
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 4. Accrual continues at the new rate after the checkpoint
+// ---------------------------------------------------------------------------
+#[test]
+fn decrease_rate_forward_accrual_uses_new_rate() {
+    let ctx = TestContext::setup();
+    let sid = make_big_stream(&ctx);
+
+    ctx.env.ledger().with_mut(|l| l.timestamp = 1_000);
+    // At t=1000: old_accrued = 10*1000 = 10_000; decrease to rate=4
+    ctx.client().decrease_rate_per_second(&sid, &4_i128);
+
+    ctx.env.ledger().with_mut(|l| l.timestamp = 1_500);
+    let accrued = ctx.client().calculate_accrued(&sid);
+    // checkpoint=10_000 at t=1000; new: 4*(1500-1000)=2000; total=12000
+    assert_eq!(accrued, 12_000);
+}
+
+// ---------------------------------------------------------------------------
+// 5. Withdrawal after decrease works correctly
+// ---------------------------------------------------------------------------
+#[test]
+fn decrease_rate_partial_withdrawal_then_decrease_then_withdraw() {
+    let ctx = TestContext::setup();
+    let sid = make_big_stream(&ctx);
+
+    // Withdraw at t=400: 10*400=4000
+    ctx.env.ledger().with_mut(|l| l.timestamp = 400);
+    let w1 = ctx.client().withdraw(&sid);
+    assert_eq!(w1, 4_000);
+
+    // Decrease rate at t=400 to 6 tok/s
+    ctx.client().decrease_rate_per_second(&sid, &6_i128);
+
+    // Withdraw again at t=600: checkpoint=4000; new: 6*(600-400)=1200; total=5200; withdrawable=5200-4000=1200
+    ctx.env.ledger().with_mut(|l| l.timestamp = 600);
+    let w2 = ctx.client().withdraw(&sid);
+    assert_eq!(w2, 1_200);
+
+    let state = ctx.client().get_stream_state(&sid);
+    assert_eq!(state.withdrawn_amount, 5_200);
+}
+
+// ---------------------------------------------------------------------------
+// 6. Multiple sequential decreases are handled correctly
+// ---------------------------------------------------------------------------
+#[test]
+fn decrease_rate_multiple_decreases_compose_correctly() {
+    let ctx = TestContext::setup();
+    let sid = make_big_stream(&ctx);
+
+    // t=200: accrued=2000, decrease 10→6
+    ctx.env.ledger().with_mut(|l| l.timestamp = 200);
+    ctx.client().decrease_rate_per_second(&sid, &6_i128);
+
+    // t=500: accrued = 2000 + 6*(500-200)=3800; decrease 6→2
+    ctx.env.ledger().with_mut(|l| l.timestamp = 500);
+    ctx.client().decrease_rate_per_second(&sid, &2_i128);
+
+    // t=1000: accrued = 3800 + 2*(1000-500)=4800
+    ctx.env.ledger().with_mut(|l| l.timestamp = 1_000);
+    let accrued = ctx.client().calculate_accrued(&sid);
+    assert_eq!(accrued, 4_800);
+}
+
+// ---------------------------------------------------------------------------
+// 7. Decrease while paused succeeds
+// ---------------------------------------------------------------------------
+#[test]
+fn decrease_rate_while_paused_succeeds() {
+    let ctx = TestContext::setup();
+    let sid = make_big_stream(&ctx);
+
+    ctx.env.ledger().with_mut(|l| l.timestamp = 100);
+    ctx.client().pause_stream(&sid);
+
+    // Decrease rate on a paused stream must succeed.
+    ctx.client().decrease_rate_per_second(&sid, &1_i128);
+
+    let state = ctx.client().get_stream_state(&sid);
+    assert_eq!(state.rate_per_second, 1);
+    assert_eq!(state.status, StreamStatus::Paused);
+}
+
+// ---------------------------------------------------------------------------
+// 8. Cancel after decrease refunds the correct amount
+// ---------------------------------------------------------------------------
+#[test]
+fn decrease_rate_then_cancel_correct_refund() {
+    let ctx = TestContext::setup();
+    let sid = make_big_stream(&ctx);
+
+    // At t=500 decrease rate 10→5
+    ctx.env.ledger().with_mut(|l| l.timestamp = 500);
+    ctx.client().decrease_rate_per_second(&sid, &5_i128);
+
+    // deposit after decrease = 5000 + 5*(2000-500) = 12500
+    // At t=800 cancel: accrued = 5000 + 5*(800-500)=6500; refund = 12500-6500=6000
+    ctx.env.ledger().with_mut(|l| l.timestamp = 800);
+    let sender_before = ctx.token.balance(&ctx.sender);
+    ctx.client().cancel_stream(&sid);
+    let refund = ctx.token.balance(&ctx.sender) - sender_before;
+    assert_eq!(refund, 6_000);
+}
+
+// ---------------------------------------------------------------------------
+// 9. Recipient can still withdraw accrued after cancel following decrease
+// ---------------------------------------------------------------------------
+#[test]
+fn decrease_rate_cancel_recipient_can_still_withdraw() {
+    let ctx = TestContext::setup();
+    let sid = make_big_stream(&ctx);
+
+    ctx.env.ledger().with_mut(|l| l.timestamp = 400);
+    ctx.client().decrease_rate_per_second(&sid, &5_i128);
+    // checkpointed_amount = 4000; new deposit = 4000 + 5*(2000-400) = 12000
+
+    ctx.env.ledger().with_mut(|l| l.timestamp = 700);
+    ctx.client().cancel_stream(&sid);
+    // accrued at cancel = 4000 + 5*(700-400)=5500
+
+    ctx.env.ledger().with_mut(|l| l.timestamp = 800);
+    let recipient_before = ctx.token.balance(&ctx.recipient);
+    let withdrawn = ctx.client().withdraw(&sid);
+    let recipient_after = ctx.token.balance(&ctx.recipient);
+    assert_eq!(withdrawn, 5_500);
+    assert_eq!(recipient_after - recipient_before, 5_500);
+}
+
+// ---------------------------------------------------------------------------
+// 10. Error cases
+// ---------------------------------------------------------------------------
+
+#[test]
+fn decrease_rate_rejects_rate_equal_to_current() {
+    let ctx = TestContext::setup();
+    let sid = make_big_stream(&ctx);
+    ctx.env.ledger().with_mut(|l| l.timestamp = 100);
+    let r = ctx.client().try_decrease_rate_per_second(&sid, &10_i128);
+    assert_eq!(r, Err(Ok(ContractError::InvalidParams)));
+}
+
+#[test]
+fn decrease_rate_rejects_rate_higher_than_current() {
+    let ctx = TestContext::setup();
+    let sid = make_big_stream(&ctx);
+    ctx.env.ledger().with_mut(|l| l.timestamp = 100);
+    let r = ctx.client().try_decrease_rate_per_second(&sid, &20_i128);
+    assert_eq!(r, Err(Ok(ContractError::InvalidParams)));
+}
+
+#[test]
+fn decrease_rate_rejects_zero_rate() {
+    let ctx = TestContext::setup();
+    let sid = make_big_stream(&ctx);
+    ctx.env.ledger().with_mut(|l| l.timestamp = 100);
+    let r = ctx.client().try_decrease_rate_per_second(&sid, &0_i128);
+    assert_eq!(r, Err(Ok(ContractError::InvalidParams)));
+}
+
+#[test]
+fn decrease_rate_rejects_negative_rate() {
+    let ctx = TestContext::setup();
+    let sid = make_big_stream(&ctx);
+    ctx.env.ledger().with_mut(|l| l.timestamp = 100);
+    let r = ctx.client().try_decrease_rate_per_second(&sid, &(-1_i128));
+    assert_eq!(r, Err(Ok(ContractError::InvalidParams)));
+}
+
+#[test]
+fn decrease_rate_rejects_expired_stream() {
+    let ctx = TestContext::setup();
+    let sid = make_big_stream(&ctx);
+    // Move past end_time=2000
+    ctx.env.ledger().with_mut(|l| l.timestamp = 2_001);
+    let r = ctx.client().try_decrease_rate_per_second(&sid, &5_i128);
+    assert_eq!(r, Err(Ok(ContractError::InvalidState)));
+}
+
+#[test]
+fn decrease_rate_rejects_completed_stream() {
+    let ctx = TestContext::setup();
+    let sid = make_big_stream(&ctx);
+    ctx.env.ledger().with_mut(|l| l.timestamp = 2_000);
+    ctx.client().withdraw(&sid);
+    // Now status is Completed
+    let r = ctx.client().try_decrease_rate_per_second(&sid, &5_i128);
+    assert_eq!(r, Err(Ok(ContractError::StreamTerminalState)));
+}
+
+#[test]
+fn decrease_rate_rejects_cancelled_stream() {
+    let ctx = TestContext::setup();
+    let sid = make_big_stream(&ctx);
+    ctx.env.ledger().with_mut(|l| l.timestamp = 100);
+    ctx.client().cancel_stream(&sid);
+    let r = ctx.client().try_decrease_rate_per_second(&sid, &5_i128);
+    assert_eq!(r, Err(Ok(ContractError::StreamTerminalState)));
+}
+
+#[test]
+fn decrease_rate_rejects_nonexistent_stream() {
+    let ctx = TestContext::setup();
+    let r = ctx.client().try_decrease_rate_per_second(&999_u64, &5_i128);
+    assert_eq!(r, Err(Ok(ContractError::StreamNotFound)));
+}
+
+// ---------------------------------------------------------------------------
+// 11. Boundary: decrease exactly at start_time (before any time passes)
+// ---------------------------------------------------------------------------
+#[test]
+fn decrease_rate_at_start_time() {
+    let ctx = TestContext::setup();
+    let sid = make_big_stream(&ctx);
+
+    // Still at t=0 (start_time=0): no accrual yet
+    ctx.env.ledger().with_mut(|l| l.timestamp = 0);
+    ctx.client().decrease_rate_per_second(&sid, &5_i128);
+
+    let state = ctx.client().get_stream_state(&sid);
+    assert_eq!(state.checkpointed_amount, 0);
+    assert_eq!(state.rate_per_second, 5);
+    // New deposit = 0 + 5*2000 = 10000; refund = 20000-10000 = 10000
+    assert_eq!(state.deposit_amount, 10_000);
+}
+
+// ---------------------------------------------------------------------------
+// 12. Decrease before cliff: cliff guard still applies post-decrease
+// ---------------------------------------------------------------------------
+#[test]
+fn decrease_rate_before_cliff_cliff_guard_preserved() {
+    let ctx = TestContext::setup();
+    // stream: start=0, cliff=500, end=2000, rate=10, deposit=20000
+    StellarAssetClient::new(&ctx.env, &ctx.token_id).mint(&ctx.sender, &20_000_i128);
+    let sid = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &20_000_i128,
+        &10_i128,
+        &0u64,
+        &500u64, // cliff
+        &2_000u64,
+    );
+
+    // Decrease at t=200 (before cliff)
+    ctx.env.ledger().with_mut(|l| l.timestamp = 200);
+    ctx.client().decrease_rate_per_second(&sid, &5_i128);
+
+    // At t=400 (still before cliff): withdrawable must be 0
+    ctx.env.ledger().with_mut(|l| l.timestamp = 400);
+    let w = ctx.client().get_withdrawable(&sid);
+    assert_eq!(w, 0, "before cliff, nothing is withdrawable");
+
+    // At t=600 (past cliff): accrued = 0 + 5*(600-200)=2000
+    ctx.env.ledger().with_mut(|l| l.timestamp = 600);
+    let accrued = ctx.client().calculate_accrued(&sid);
+    assert_eq!(accrued, 2_000);
+}
+
+// ---------------------------------------------------------------------------
+// 13. RateDecreased event is emitted with correct fields
+// ---------------------------------------------------------------------------
+#[test]
+fn decrease_rate_emits_rate_dec_event() {
+    let ctx = TestContext::setup();
+    let sid = make_big_stream(&ctx);
+
+    ctx.env.ledger().with_mut(|l| l.timestamp = 300);
+    ctx.client().decrease_rate_per_second(&sid, &3_i128);
+
+    let events = ctx.env.events().all();
+    let found = events.iter().any(|e| {
+        if e.1.len() < 2 {
+            return false;
+        }
+        let s = Symbol::try_from_val(&ctx.env, &e.1.get(0).unwrap_or(soroban_sdk::Val::VOID.into()));
+        let id = u64::try_from_val(&ctx.env, &e.1.get(1).unwrap_or(soroban_sdk::Val::VOID.into()));
+        matches!((s, id), (Ok(sym), Ok(id)) if sym == Symbol::new(&ctx.env, "rate_dec") && id == sid)
+    });
+    assert!(found, "rate_dec event must be emitted");
+}
+
+// ---------------------------------------------------------------------------
+// 14. get_claimable_at reflects checkpoint after decrease
+// ---------------------------------------------------------------------------
+#[test]
+fn decrease_rate_get_claimable_at_reflects_checkpoint() {
+    let ctx = TestContext::setup();
+    let sid = make_big_stream(&ctx);
+
+    ctx.env.ledger().with_mut(|l| l.timestamp = 500);
+    ctx.client().decrease_rate_per_second(&sid, &4_i128);
+
+    // At t=800: checkpoint=5000 at t=500; added=4*(800-500)=1200; total=6200; withdrawn=0
+    let claimable = ctx.client().get_claimable_at(&sid, &800);
+    assert_eq!(claimable, 6_200);
+}
+
+// ---------------------------------------------------------------------------
+// 15. Invariant: accrual(t) monotone across a decrease boundary
+// ---------------------------------------------------------------------------
+#[test]
+fn decrease_rate_accrual_monotone_across_boundary() {
+    let ctx = TestContext::setup();
+    let sid = make_big_stream(&ctx);
+
+    let check_times: [u64; 8] = [0, 100, 200, 300, 400, 500, 1000, 2000];
+    let mut prev = 0i128;
+    for &t in &check_times {
+        ctx.env.ledger().with_mut(|l| l.timestamp = t);
+        if t == 300 {
+            ctx.client().decrease_rate_per_second(&sid, &5_i128);
+        }
+        let accrued = ctx.client().calculate_accrued(&sid);
+        assert!(
+            accrued >= prev,
+            "accrual not monotone at t={t}: prev={prev} got={accrued}"
+        );
+        prev = accrued;
+    }
 }
