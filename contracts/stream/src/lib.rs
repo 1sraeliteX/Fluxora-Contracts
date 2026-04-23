@@ -5,7 +5,7 @@ mod accrual;
 mod checksum;
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, panic_with_error, symbol_short, token, Address, Env,
+    contract, contractimpl, contracttype, symbol_short, token, Address, Env,
 };
 
 // ---------------------------------------------------------------------------
@@ -20,6 +20,17 @@ const INSTANCE_BUMP_AMOUNT: u32 = 120_960;
 const PERSISTENT_LIFETIME_THRESHOLD: u32 = 17_280;
 /// Extend persistent entries to ~7 days of ledgers.
 const PERSISTENT_BUMP_AMOUNT: u32 = 120_960;
+
+// ---------------------------------------------------------------------------
+// Pagination limits (DoS prevention)
+// ---------------------------------------------------------------------------
+
+/// Maximum page size for paginated export views.
+///
+/// Prevents unbounded memory usage and gas exhaustion when exporting stream data.
+/// All paginated entrypoints enforce this limit strictly.
+pub const MAX_PAGE_SIZE: u64 = 100;
+
 // Contract version
 // ---------------------------------------------------------------------------
 
@@ -122,6 +133,8 @@ pub enum ContractError {
     StreamNotPaused = 12,
     /// Stream is in a terminal state (Completed or Cancelled) and cannot be modified.
     StreamTerminalState = 13,
+    /// Duplicate stream IDs were supplied to a batch operation.
+    DuplicateStreamId = 14,
 }
 
 #[contracttype]
@@ -298,6 +311,33 @@ pub struct CreateStreamParams {
     pub end_time: u64,
 }
 
+/// Parameters for creating a payment stream with relative (offset-based) times.
+///
+/// Computes `start_time`, `cliff_time`, and `end_time` by adding offsets to the
+/// current ledger timestamp (`env.ledger().timestamp()`). This eliminates off-chain
+/// calculation errors that lead to `StartTimeInPast` failures.
+///
+/// # Time offsets
+/// - `start_delay`: Seconds to add to current timestamp for stream start
+/// - `cliff_delay`: Seconds to add to current timestamp for cliff time (must be >= start_delay)
+/// - `duration`: Total duration of stream in seconds (end_time = start_time + duration)
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreateStreamRelativeParams {
+    /// Address that will receive streamed tokens for this stream entry.
+    pub recipient: Address,
+    /// Total amount escrowed for this stream entry.
+    pub deposit_amount: i128,
+    /// Streaming speed in tokens per second for this stream entry.
+    pub rate_per_second: i128,
+    /// Delay (in seconds) before stream accrual starts, relative to current timestamp.
+    pub start_delay: u64,
+    /// Delay (in seconds) before withdrawals are allowed, relative to current timestamp.
+    pub cliff_delay: u64,
+    /// Total duration the stream runs (in seconds) from start_time to end_time.
+    pub duration: u64,
+}
+
 /// Namespace for all contract storage keys.
 ///
 /// # Evolution policy
@@ -383,12 +423,13 @@ fn is_creation_paused(env: &Env) -> bool {
         .unwrap_or(false)
 }
 
-/// Panics when [`is_global_emergency_paused`] is true. Admin/admin-override entrypoints
-/// must not call this so operators can still intervene.
-fn require_not_globally_paused(env: &Env) {
+/// Returns `Err(ContractError::ContractPaused)` when [`is_global_emergency_paused`] is true.
+/// Admin/admin-override entrypoints must not call this so operators can still intervene.
+fn require_not_globally_paused(env: &Env) -> Result<(), ContractError> {
     if is_global_emergency_paused(env) {
-        panic_with_error!(env, ContractError::ContractPaused);
+        return Err(ContractError::ContractPaused);
     }
+    Ok(())
 }
 
 fn read_stream_count(env: &Env) -> u64 {
@@ -890,6 +931,105 @@ impl FluxoraStream {
         ))
     }
 
+    /// Create a new payment stream with relative (offset-based) timing.
+    ///
+    /// Computes absolute timestamps by adding delays to the current ledger timestamp,
+    /// eliminating off-chain calculation errors that cause `StartTimeInPast` failures.
+    /// Internally delegates to `create_stream` with computed absolute times.
+    ///
+    /// # Parameters
+    /// - `sender`: Address funding and authorizing the stream
+    /// - `recipient`: Address receiving streamed tokens
+    /// - `deposit_amount`: Total amount escrowed for the stream
+    /// - `rate_per_second`: Streaming speed in tokens per second
+    /// - `start_delay`: Seconds until stream starts (relative to current timestamp)
+    /// - `cliff_delay`: Seconds until cliff time (relative to current timestamp)
+    /// - `duration`: Total duration stream runs (in seconds)
+    ///
+    /// # Computation
+    /// Uses `current_time = env.ledger().timestamp()`:
+    /// - `start_time = current_time + start_delay`
+    /// - `cliff_time = current_time + cliff_delay`
+    /// - `end_time = start_time + duration`
+    ///
+    /// # Returns
+    /// - `u64`: Unique stream ID
+    ///
+    /// # Authorization
+    /// - Requires authorization from `sender`
+    ///
+    /// # Success Semantics
+    /// - All validation invariants from `create_stream` are preserved
+    /// - Batch `create_streams_relative` can use this via parameter conversion
+    /// - Contract paused state is checked (blocks creation if paused)
+    ///
+    /// # Failure Semantics
+    /// - `StartTimeInPast`: Never occurs (times are always relative to current)
+    /// - `InvalidParams`: If delays/duration cause arithmetic overflow or invalid constraints
+    /// - `ContractPaused`: If creation is globally paused
+    /// - Other errors inherited from `create_stream` validation
+    ///
+    /// # Errors
+    /// Delegates to `create_stream`; see its documentation for full error list.
+    ///
+    /// # Panics
+    /// - If `start_delay + current_time` overflows `u64` (arithmetic overflow)
+    /// - If token transfer fails
+    ///
+    /// # Security Notes
+    /// - Relative timing removes the need for precise off-chain clock synchronization
+    /// - All deposit and rate validation proceeds as-is; relative delays do not bypass checks
+    /// - Self-streaming (`sender == recipient`) is still rejected by `create_stream`
+    ///
+    /// # Example
+    /// ```
+    /// // Create a stream starting in 2 days, cliff in 5 days, running for 30 days
+    /// let stream_id = contract.create_stream_relative(
+    ///     &sender,
+    ///     &recipient,
+    ///     &100_000_000,        // 100M tokens
+    ///     &1_157_407,           // ~1% per day at 86400s/day
+    ///     &(2 * 86400),         // 2 days delay
+    ///     &(5 * 86400),         // 5 days cliff
+    ///     &(30 * 86400),        // 30 days duration
+    /// )?;
+    /// ```
+    pub fn create_stream_relative(
+        env: Env,
+        sender: Address,
+        recipient: Address,
+        deposit_amount: i128,
+        rate_per_second: i128,
+        start_delay: u64,
+        cliff_delay: u64,
+        duration: u64,
+    ) -> Result<u64, ContractError> {
+        let current_time = env.ledger().timestamp();
+
+        // Compute absolute times with overflow checks
+        let start_time = current_time
+            .checked_add(start_delay)
+            .ok_or(ContractError::InvalidParams)?;
+        let cliff_time = current_time
+            .checked_add(cliff_delay)
+            .ok_or(ContractError::InvalidParams)?;
+        let end_time = start_time
+            .checked_add(duration)
+            .ok_or(ContractError::InvalidParams)?;
+
+        // Delegate to standard create_stream with computed absolute times
+        Self::create_stream(
+            env,
+            sender,
+            recipient,
+            deposit_amount,
+            rate_per_second,
+            start_time,
+            cliff_time,
+            end_time,
+        )
+    }
+
     /// Create multiple payment streams in a single transaction.
     ///
     /// Optimizes gas usage by authorizing once and doing a single bulk token transfer
@@ -925,8 +1065,6 @@ impl FluxoraStream {
     /// - `Unauthorized` (7): Sender signature is missing.
     ///
     /// # Panics
-    /// - If any entry violates `create_stream` validation rules
-    /// - If total batch deposit overflows `i128` (`"overflow calculating total batch deposit"`)
     /// - If token transfer fails due to sender balance/allowance constraints
     ///
     /// # Security Notes
@@ -1043,9 +1181,7 @@ impl FluxoraStream {
             )?;
             total_deposit = total_deposit
                 .checked_add(params.deposit_amount)
-                .unwrap_or_else(|| {
-                    panic_with_error!(env, ContractError::ArithmeticOverflow);
-                });
+                .ok_or(ContractError::ArithmeticOverflow)?;
         }
 
         // Bulk transfer tokens from sender to this contract atomically to save gas.
@@ -1071,6 +1207,109 @@ impl FluxoraStream {
         }
 
         Ok(created_ids)
+    }
+
+    /// Create multiple payment streams with relative (offset-based) timing.
+    ///
+    /// Batch version of `create_stream_relative` that converts relative time offsets
+    /// to absolute timestamps and delegates to `create_streams`. Provides the same
+    /// atomicity and gas efficiency as `create_streams` while eliminating off-chain
+    /// timestamp calculation errors.
+    ///
+    /// # Parameters
+    /// - `sender`: Address funding all streams in the batch
+    /// - `streams_relative`: Vector of `CreateStreamRelativeParams` with relative time offsets
+    ///
+    /// # Returns
+    /// - `Vec<u64>`: Stream IDs in the same order as `streams_relative` input entries
+    ///
+    /// # Authorization
+    /// - Requires authorization from `sender` exactly once for the entire batch
+    ///
+    /// # Time Computation
+    /// Uses `current_time = env.ledger().timestamp()`:
+    /// For each entry:
+    /// - `start_time = current_time + start_delay`
+    /// - `cliff_time = current_time + cliff_delay`
+    /// - `end_time = start_time + duration`
+    ///
+    /// # Success Semantics
+    /// - Empty batch returns `Ok(Vec::new())` without side effects
+    /// - All validation invariants from `create_streams` are preserved
+    /// - Relative timing eliminates `StartTimeInPast` errors
+    /// - Single token transfer for all streams (atomic)
+    ///
+    /// # Failure Semantics
+    /// - Any entry's time offset causes arithmetic overflow → `InvalidParams`
+    /// - Any validation failure → entire batch fails atomically
+    /// - Any token transfer failure → no state change
+    /// - No events emitted on failure
+    ///
+    /// # Security Notes
+    /// - Relative timing removes need for off-chain clock synchronization
+    /// - All deposit, rate, and deposit-coverage validation proceeds as-is
+    /// - Self-streaming still rejected per entry
+    ///
+    /// # Example
+    /// ```ignore
+    /// let params = vec![
+    ///     CreateStreamRelativeParams {
+    ///         recipient: alice,
+    ///         deposit_amount: 1000,
+    ///         rate_per_second: 1,
+    ///         start_delay: 86400,      // 1 day
+    ///         cliff_delay: 259200,     // 3 days
+    ///         duration: 2592000,       // 30 days
+    ///     },
+    ///     CreateStreamRelativeParams {
+    ///         recipient: bob,
+    ///         deposit_amount: 2000,
+    ///         rate_per_second: 2,
+    ///         start_delay: 0,          // Immediate
+    ///         cliff_delay: 0,          // Immediate
+    ///         duration: 2592000,       // 30 days
+    ///     },
+    /// ];
+    /// let ids = contract.create_streams_relative(&sender, &params)?;
+    /// // ids = [0, 1] (assuming first batch)
+    /// ```
+    pub fn create_streams_relative(
+        env: Env,
+        sender: Address,
+        streams_relative: soroban_sdk::Vec<CreateStreamRelativeParams>,
+    ) -> Result<soroban_sdk::Vec<u64>, ContractError> {
+        if streams_relative.is_empty() {
+            return Ok(soroban_sdk::Vec::new(&env));
+        }
+
+        let current_time = env.ledger().timestamp();
+        let mut absolute_streams = soroban_sdk::Vec::new(&env);
+
+        // Convert relative parameters to absolute times
+        for rel_params in streams_relative.iter() {
+            let start_time = current_time
+                .checked_add(rel_params.start_delay)
+                .ok_or(ContractError::InvalidParams)?;
+            let cliff_time = current_time
+                .checked_add(rel_params.cliff_delay)
+                .ok_or(ContractError::InvalidParams)?;
+            let end_time = start_time
+                .checked_add(rel_params.duration)
+                .ok_or(ContractError::InvalidParams)?;
+
+            let absolute_params = CreateStreamParams {
+                recipient: rel_params.recipient,
+                deposit_amount: rel_params.deposit_amount,
+                rate_per_second: rel_params.rate_per_second,
+                start_time,
+                cliff_time,
+                end_time,
+            };
+            absolute_streams.push_back(absolute_params);
+        }
+
+        // Delegate to standard create_streams with converted absolute times
+        Self::create_streams(env, sender, absolute_streams)
     }
 
     /// Pause an active payment stream.
@@ -1234,7 +1473,7 @@ impl FluxoraStream {
     /// - Cancel at 100% completion → sender gets 0% refund, recipient can withdraw 100%
     /// - Cancel before cliff → sender gets 100% refund (no accrual before cliff)
     pub fn cancel_stream(env: Env, stream_id: u64) -> Result<(), ContractError> {
-        require_not_globally_paused(&env);
+        require_not_globally_paused(&env)?;
         let mut stream = load_stream(&env, stream_id)?;
         Self::require_stream_sender(&stream.sender);
         Self::cancel_stream_internal(&env, &mut stream)
@@ -1297,7 +1536,7 @@ impl FluxoraStream {
     /// - At t=800: withdraw() returns 500 tokens (800 - 300 already withdrawn)
     /// - At t=1000: withdraw() returns 200 tokens, status → Completed
     pub fn withdraw(env: Env, stream_id: u64) -> Result<i128, ContractError> {
-        require_not_globally_paused(&env);
+        require_not_globally_paused(&env)?;
         let mut stream = load_stream(&env, stream_id)?;
 
         // Enforce recipient-only authorization
@@ -1416,7 +1655,7 @@ impl FluxoraStream {
         stream_id: u64,
         destination: Address,
     ) -> Result<i128, ContractError> {
-        require_not_globally_paused(&env);
+        require_not_globally_paused(&env)?;
         let mut stream = load_stream(&env, stream_id)?;
 
         // Enforce recipient-only authorization for source of funds
@@ -1483,12 +1722,12 @@ impl FluxoraStream {
     /// The caller must be the recipient of every stream in `stream_ids`. Each stream
     /// is processed in order: same validation and accounting as `withdraw`. Events
     /// are emitted per stream. The operation is atomic: if any stream fails
-    /// (e.g. not found, not recipient's, or paused), the entire call panics
+    /// (e.g. not found, not recipient's, or paused), the entire call returns an error
     /// and no state changes or transfers occur.
     ///
     /// # Parameters
     /// - `recipient`: Address that must authorize and must be the recipient of all streams
-    /// - `stream_ids`: Stream IDs to withdraw from (**must be unique**; duplicates panic)
+    /// - `stream_ids`: Stream IDs to withdraw from (**must be unique**; duplicates return `DuplicateStreamId`)
     ///
     /// # Returns
     /// - `Vec<BatchWithdrawResult>`: Per-stream `(stream_id, amount)` for each entry.
@@ -1507,7 +1746,7 @@ impl FluxoraStream {
     /// - No errors are raised (empty batch is valid)
     ///
     /// # Completed streams
-    /// A `Completed` stream in the batch does **not** panic. It contributes a zero-amount
+    /// A `Completed` stream in the batch does **not** error. It contributes a zero-amount
     /// result and is skipped silently. This allows callers to pass a mixed list of active
     /// and already-completed streams without pre-filtering.
     ///
@@ -1520,15 +1759,15 @@ impl FluxoraStream {
     /// - Requires authorization from `recipient` once for the entire batch
     ///
     /// # Atomicity
-    /// - All streams are processed in order. Any panic (stream not found, wrong recipient,
-    ///   paused) reverts the whole transaction.
+    /// - All streams are processed in order. Any error (stream not found, wrong recipient,
+    ///   paused, or duplicate IDs) reverts the whole transaction.
     /// - Completed streams are not an error: they produce amount `0` and no events.
     pub fn batch_withdraw(
         env: Env,
         recipient: Address,
         stream_ids: soroban_sdk::Vec<u64>,
     ) -> Result<soroban_sdk::Vec<BatchWithdrawResult>, ContractError> {
-        require_not_globally_paused(&env);
+        require_not_globally_paused(&env)?;
         recipient.require_auth();
 
         let n = stream_ids.len();
@@ -1536,10 +1775,9 @@ impl FluxoraStream {
             let a = stream_ids.get(i).unwrap();
             let mut j = i + 1;
             while j < n {
-                assert!(
-                    stream_ids.get(j).unwrap() != a,
-                    "batch_withdraw stream_ids must be unique"
-                );
+                if stream_ids.get(j).unwrap() == a {
+                    return Err(ContractError::DuplicateStreamId);
+                }
                 j += 1;
             }
         }
@@ -1937,7 +2175,7 @@ impl FluxoraStream {
         stream_id: u64,
         new_rate_per_second: i128,
     ) -> Result<(), ContractError> {
-        require_not_globally_paused(&env);
+        require_not_globally_paused(&env)?;
         let mut stream = load_stream(&env, stream_id)?;
 
         // Only the original sender can update the rate.
@@ -1962,9 +2200,7 @@ impl FluxoraStream {
         let duration = (stream.end_time - stream.start_time) as i128;
         let total_streamable = new_rate_per_second
             .checked_mul(duration)
-            .unwrap_or_else(|| {
-                panic_with_error!(env, ContractError::ArithmeticOverflow);
-            });
+            .ok_or(ContractError::ArithmeticOverflow)?;
 
         if stream.deposit_amount < total_streamable {
             return Err(ContractError::InsufficientDeposit);
@@ -2176,7 +2412,7 @@ impl FluxoraStream {
         stream_id: u64,
         new_end_time: u64,
     ) -> Result<(), ContractError> {
-        require_not_globally_paused(&env);
+        require_not_globally_paused(&env)?;
         let mut stream = load_stream(&env, stream_id)?;
 
         // Only the original sender can modify the schedule.
@@ -2201,9 +2437,7 @@ impl FluxoraStream {
         let new_max_streamable = stream
             .rate_per_second
             .checked_mul(new_duration)
-            .unwrap_or_else(|| {
-                panic_with_error!(env, ContractError::ArithmeticOverflow);
-            });
+            .ok_or(ContractError::ArithmeticOverflow)?;
 
         // Deposit must still be sufficient to cover the shortened schedule (by construction
         // this should hold given the original validation, but we keep an explicit assert).
@@ -2267,7 +2501,7 @@ impl FluxoraStream {
         stream_id: u64,
         new_end_time: u64,
     ) -> Result<(), ContractError> {
-        require_not_globally_paused(&env);
+        require_not_globally_paused(&env)?;
         let mut stream = load_stream(&env, stream_id)?;
 
         // Only the original sender can modify the schedule.
@@ -2292,9 +2526,7 @@ impl FluxoraStream {
         let new_total_streamable = stream
             .rate_per_second
             .checked_mul(new_duration)
-            .unwrap_or_else(|| {
-                panic_with_error!(env, ContractError::ArithmeticOverflow);
-            });
+            .ok_or(ContractError::ArithmeticOverflow)?;
 
         if new_total_streamable > stream.deposit_amount {
             return Err(ContractError::InsufficientDeposit);
@@ -2566,6 +2798,151 @@ impl FluxoraStream {
     /// - Closed streams are not included in the count
     pub fn get_recipient_stream_count(env: Env, recipient: Address) -> u64 {
         load_recipient_streams(&env, &recipient).len() as u64
+    }
+
+    /// Export streams by ID range with bounded page size (operator migration support).
+    ///
+    /// Returns a paginated list of streams within the specified ID range `[start_id, end_id]`.
+    /// This enables efficient, bounded data export for off-chain migration between contract
+    /// instances without unbounded loops or memory exhaustion.
+    ///
+    /// # Parameters
+    /// - `start_id`: First stream ID to include in the range (inclusive)
+    /// - `end_id`: Last stream ID to include in the range (inclusive). Use `u64::MAX` for open-ended.
+    /// - `limit`: Maximum number of streams to return (capped at [`MAX_PAGE_SIZE`])
+    ///
+    /// # Returns
+    /// - `Vec<Stream>`: Vector of stream structs in ascending order by stream_id
+    ///   - Empty if no streams exist in the range
+    ///   - Partial results if some stream IDs in range don't exist (deleted/closed)
+    ///   - Length never exceeds `min(limit, MAX_PAGE_SIZE)`
+    ///
+    /// # Pagination Strategy
+    /// For complete export across all streams:
+    /// 1. Call `get_stream_count()` to get total stream count
+    /// 2. Iterate in chunks: `get_streams_by_id_range(1, 100, 100)`, `get_streams_by_id_range(101, 200, 100)`, etc.
+    /// 3. Handle missing IDs gracefully (some may be closed/archived)
+    ///
+    /// # DoS Protection
+    /// - `limit` is strictly capped at [`MAX_PAGE_SIZE`] (100)
+    /// - Range size is bounded by `limit`, not `end_id - start_id`
+    /// - Each stream lookup is O(1), total gas is O(limit)
+    ///
+    /// # Errors
+    /// - Returns empty vector if `start_id > end_id`
+    /// - Non-existent stream IDs are silently skipped
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Export first 50 streams (IDs 1-50)
+    /// let streams = get_streams_by_id_range(&env, 1, 50, 50);
+    ///
+    /// // Export next page using open-ended range
+    /// let streams = get_streams_by_id_range(&env, 51, u64::MAX, 100);
+    /// ```
+    pub fn get_streams_by_id_range(
+        env: Env,
+        start_id: u64,
+        end_id: u64,
+        limit: u64,
+    ) -> soroban_sdk::Vec<Stream> {
+        // Enforce DoS protection limit
+        let page_size = limit.min(MAX_PAGE_SIZE);
+        let mut result = soroban_sdk::Vec::new(&env);
+
+        // Handle invalid range
+        if start_id > end_id || page_size == 0 {
+            return result;
+        }
+
+        let total_count = read_stream_count(&env);
+        let effective_end = end_id.min(total_count);
+
+        let mut current_id = start_id;
+        while current_id <= effective_end && result.len() < page_size as u32 {
+            // Try to load stream, skip if not found (closed/archived)
+            if let Ok(stream) = load_stream(&env, current_id) {
+                result.push_back(stream);
+            }
+            current_id += 1;
+        }
+
+        result
+    }
+
+    /// Paginated export of recipient streams with cursor-based pagination.
+    ///
+    /// Returns a bounded page of stream IDs for a recipient starting from a cursor position.
+    /// Designed for efficient, resumable export of large recipient portfolios without
+    /// unbounded memory usage.
+    ///
+    /// # Parameters
+    /// - `recipient`: Address to query streams for
+    /// - `cursor`: Starting position in the recipient's stream list (0-based index).
+    ///   Use 0 for first page, then `cursor + previous_result.len()` for next page.
+    /// - `limit`: Maximum number of streams to return (capped at [`MAX_PAGE_SIZE`])
+    ///
+    /// # Returns
+    /// - `Vec<u64>`: Vector of stream IDs in ascending order
+    ///   - Empty vector if `cursor >= recipient_stream_count`
+    ///   - Length never exceeds `min(limit, MAX_PAGE_SIZE)`
+    ///
+    /// # Cursor Semantics
+    /// - Cursor is a 0-based index into the sorted recipient stream list
+    /// - After each call, next cursor = `cursor + result.len()`
+    /// - When result.len() < limit, you've reached the end
+    /// - Cursor survives stream list mutations (insertions/removals shift indices naturally)
+    ///
+    /// # Pagination Strategy
+    /// ```ignore
+    /// let mut cursor = 0;
+    /// let page_size = 50;
+    /// loop {
+    ///     let page = get_recipient_streams_paginated(&env, &recipient, cursor, page_size);
+    ///     if page.is_empty() { break; }
+    ///     // Process page...
+    ///     cursor += page.len();
+    /// }
+    /// ```
+    ///
+    /// # DoS Protection
+    /// - `limit` is strictly capped at [`MAX_PAGE_SIZE`] (100)
+    /// - Cursor-based pagination prevents unbounded list traversal
+    /// - Gas cost is O(limit) regardless of recipient's total stream count
+    ///
+    /// # Consistency Guarantees
+    /// - Stream list is sorted by stream_id (ascending)
+    /// - Pagination is stable: repeated calls with same cursor return same results
+    ///   unless the underlying list is modified
+    /// - New streams added during pagination may appear or not depending on insertion position
+    pub fn get_recipient_streams_paginated(
+        env: Env,
+        recipient: Address,
+        cursor: u64,
+        limit: u64,
+    ) -> soroban_sdk::Vec<u64> {
+        // Enforce DoS protection limit
+        let page_size = limit.min(MAX_PAGE_SIZE) as u32;
+        let all_streams = load_recipient_streams(&env, &recipient);
+        let total = all_streams.len() as u64;
+
+        // Return empty if cursor is beyond end
+        if cursor >= total || page_size == 0 {
+            return soroban_sdk::Vec::new(&env);
+        }
+
+        let start_idx = cursor as u32;
+        let available = total as u32 - start_idx;
+        let take_count = page_size.min(available);
+
+        let mut result = soroban_sdk::Vec::new(&env);
+        for i in 0..take_count {
+            if let Some(stream_id) = all_streams.get(start_idx + i) {
+                result.push_back(stream_id);
+            }
+        }
+
+        result
     }
 
     /// Internal helper to require authorization from the stream sender.
